@@ -1,0 +1,763 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import time, os, json, math, threading
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, TYPE_CHECKING, List, Tuple
+import requests
+from functools import lru_cache
+
+# --- Collezioni/Model (come nella tua versione) ---
+try:
+    from .Currencies import Currencies
+except ImportError:
+    from Currencies import Currencies
+
+try:
+    from .auth import authorize
+except ImportError:
+    from auth import authorize
+
+if TYPE_CHECKING:
+    from .SaveOrder import SaveOrder as _SaveOrder
+    from .Orders import Orders as _Orders
+
+API_BASE = "https://api.kraken.com"
+
+_ASSET_ALIAS = {"BTC": "XBT", "XBT": "XBT", "ETH": "ETH", "EUR": "EUR", "USD": "USD"}
+
+def _normalize_pair(pair: str) -> str:
+    base, quote = pair.upper().split("/", 1)
+    base = _ASSET_ALIAS.get(base, base)
+    quote = _ASSET_ALIAS.get(quote, quote)
+    kr_base = "XXBT" if base == "XBT" else ("XETH" if base == "ETH" else base)
+    kr_quote = "ZEUR" if quote == "EUR" else ("ZUSD" if quote == "USD" else quote)
+    return f"{kr_base}{kr_quote}"
+
+@dataclass
+class AuthState:
+    ok: bool
+    ws_token: Optional[str]
+    ws_expires_in: Optional[int]
+    server_unixtime: Optional[int]
+    balances: Dict[str, str]
+    key_last4: str
+    error: Optional[str]
+
+# ===================== InfoMarket ottimizzata =====================
+class InfoMarket:
+    """
+    Drop-in replacement della tua InfoMarket con:
+      - rate limiter + retry/backoff nelle chiamate pubbliche
+      - caching LRU di breve durata
+      - scanning più robusto/veloce in getTotalInfo
+    S T E S S E  F I R M E  P U B B L I C H E
+    """
+
+    # ---- tuning: puoi adeguare se vuoi ----
+    _PUBLIC_QPS = 1.0          # ~1 richiesta/secondo (rispettoso per Kraken public)
+    _MAX_RETRIES = 4           # retry esponenziali su 429/timeout
+    _CACHE_TTL = 8.0           # secondi: TTL minimo per cache soft
+    _HTTP_TIMEOUT = 20         # timeout di rete (s)
+
+    def __init__(self, pair: str = "BTC/EUR", verbose: bool = True):
+        self.session = requests.Session()
+        # retries lato transport (conn problem)
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        retry = Retry(
+            total=5, backoff_factor=0.2,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"])
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+
+        self.pair_human = pair
+        self.cset = Currencies()
+        self._pair_cache: Dict[str, str] = {}
+        self.pair = self._norm_pair(pair)
+
+        # token bucket per rate limit
+        self._lock = threading.Lock()
+        self._tokens = 1.0
+        self._last_refill = time.time()
+
+        # cache soft per endpoint (TTL)
+        self._soft_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+
+        a = authorize()
+        self.auth = AuthState(
+            ok=a.ok, ws_token=a.ws_token, ws_expires_in=a.ws_expires_in,
+            server_unixtime=a.server_unixtime, balances=a.balances,
+            key_last4=a.key_last4, error=a.error
+        )
+        if verbose:
+            print("[InfoMarket] Authorized:", self.auth.ok, "key_last4:", self.auth.key_last4)
+
+    # ---------------- Rate limiter + cache ----------------
+    def _acquire_token(self):
+        with self._lock:
+            now = time.time()
+            # refill
+            capacity = 1.0
+            rate = self._PUBLIC_QPS
+            self._tokens = min(capacity, self._tokens + (now - self._last_refill) * rate)
+            self._last_refill = now
+            if self._tokens < 1.0:
+                sleep_s = (1.0 - self._tokens) / rate
+                time.sleep(max(0.0, sleep_s))
+                # dopo sleep ricarica token
+                self._tokens = 0.0
+                self._last_refill = time.time()
+            else:
+                self._tokens -= 1.0
+
+    def _cache_get(self, key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+        ts_data = self._soft_cache.get(key)
+        if not ts_data:
+            return None
+        ts, data = ts_data
+        if (time.time() - ts) <= self._CACHE_TTL:
+            return data
+        return None
+
+    def _cache_set(self, key: Tuple[str, str], data: Dict[str, Any]):
+        self._soft_cache[key] = (time.time(), data)
+
+    def _public(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Chiamate public con rate-limit, retry e caching soft."""
+        params = params or {}
+        # key cache (ordinata) — evita hit duplicati in un giro
+        key = (endpoint, json.dumps({k: params[k] for k in sorted(params)}, sort_keys=True))
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
+        url = f"{API_BASE}/0/public/{endpoint}"
+        last_err = None
+        for attempt in range(self._MAX_RETRIES + 1):
+            try:
+                self._acquire_token()
+                r = self.session.get(url, params=params, timeout=self._HTTP_TIMEOUT)
+                r.raise_for_status()
+                j = r.json()
+                # alcune risposte 200 contengono "error": [...]
+                if j.get("error"):
+                    # se è rate-limit, prova backoff
+                    msg = "; ".join(j["error"])
+                    if "Too many requests" in msg or "EGeneral:Too many requests" in msg:
+                        raise requests.HTTPError("429 too many requests (Kraken payload)")
+                # ok
+                self._cache_set(key, j)
+                return j
+            except Exception as e:
+                last_err = e
+                if attempt >= self._MAX_RETRIES:
+                    break
+                # backoff esponenziale
+                time.sleep(0.6 * (2 ** attempt))
+
+        raise RuntimeError(f"Public API error {endpoint} params={params}: {last_err}")
+
+    # ---------------- Pair & params helpers ----------------
+    def _norm_pair(self, pair: str) -> str:
+        key = pair.upper()
+        if key in self._pair_cache:
+            return self._pair_cache[key]
+        if key in (v.upper() for v in self._pair_cache.values()):
+            return pair
+        try:
+            return _normalize_pair(pair)
+        except Exception:
+            return pair
+
+    def _cur(self, base: Optional[str] = None, quote: Optional[str] = None):
+        p = getattr(self, "_params", {"base": "BTC", "quote": "EUR"})
+        b = (base or p.get("base", "BTC")).upper()
+        q = (quote or p.get("quote", "EUR")).upper()
+        return self.cset.get_or_create(b, q, kr_pair=self.pair)
+
+    def getCurrencies(self) -> Currencies:
+        return self.cset
+
+    # ---------------- Public market methods (IO invariato) ----------------
+    def ticker(self, pair: Optional[str] = None) -> Dict[str, Any]:
+        p = self._norm_pair(pair or self.pair_human)
+        data = self._public("Ticker", {"pair": p})
+        if data.get("error"):
+            raise RuntimeError("Ticker error: " + "; ".join(data["error"]))
+        res = list(data["result"].values())[0]
+        bid, ask, last = float(res["b"][0]), float(res["a"][0]), float(res["c"][0])
+        mid = (bid + ask) / 2.0
+        out = {"pair": p, "bid": bid, "ask": ask, "last": last, "mid": mid}
+        cur = self._cur(); cur.update_from_ticker(out)
+        out["currency"] = cur.to_dict(); out["currencies"] = self.cset.to_dicts()
+        return out
+
+    def order_book(self, depth: int = 10, pair: Optional[str] = None) -> Dict[str, Any]:
+        p = self._norm_pair(pair or self.pair_human)
+        data = self._public("Depth", {"pair": p, "count": depth})
+        if data.get("error"):
+            raise RuntimeError("Depth error: " + "; ".join(data["error"]))
+        return list(data["result"].values())[0]
+
+    def ohlc(self, interval: int = 1, since: Optional[int] = None, pair: Optional[str] = None) -> Dict[str, Any]:
+        p = self._norm_pair(pair or self.pair_human)
+        params: Dict[str, Any] = {"pair": p, "interval": int(interval)}
+        if since: params["since"] = int(since)
+        data = self._public("OHLC", params)
+        if data.get("error"): raise RuntimeError("OHLC error: " + "; ".join(data["error"]))
+        res = data["result"][p]; last = data["result"].get("last")
+        return {"candles": res, "last": last}
+
+    def asset_info(self, pair: Optional[str] = None) -> Dict[str, Any]:
+        p = self._norm_pair(pair or self.pair_human)
+        data = self._public("AssetPairs", {"pair": p})
+        if data.get("error"): raise RuntimeError("AssetPairs error: " + "; ".join(data["error"]))
+        return list(data["result"].values())[0]
+
+    # ---------------- Auth ----------------
+    def refresh_auth(self, verbose: bool = True) -> AuthState:
+        a = authorize()
+        self.auth = AuthState(
+            ok=a.ok, ws_token=a.ws_token, ws_expires_in=a.ws_expires_in,
+            server_unixtime=a.server_unixtime, balances=a.balances,
+            key_last4=a.key_last4, error=a.error,
+        )
+        if verbose: print("[InfoMarket] Refreshed auth. OK:", self.auth.ok)
+        return self.auth
+
+    # ---------------- Range mapping (include 1Y) ----------------
+    @staticmethod
+    def _range_to_since_and_interval(range_str: str) -> Dict[str, Any]:
+        now = int(time.time())
+        rs = range_str.upper().strip()
+        if rs in {"24H", "1D"}:   return {"since": now - 24*3600,   "interval": 5}
+        if rs in {"48H", "2D"}:   return {"since": now - 2*24*3600, "interval": 5}
+        if rs in {"7D", "1W"}:    return {"since": now - 7*24*3600, "interval": 15}
+        if rs in {"30D", "1M"}:   return {"since": now - 30*24*3600,"interval": 60}
+        if rs in {"90D", "3M"}:   return {"since": now - 90*24*3600,"interval": 240}
+        if rs in {"1Y", "12M"}:   return {"since": now - 365*24*3600,"interval": 1440}  # <— 1Y
+        if rs in {"ALL", "MAX", "*"}: return {"since": 0, "interval": 1440}
+        # data YYYY-MM-DD
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.strptime(range_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            since = int(dt.timestamp()); span = now - since
+            if   span <= 2*24*3600:   interval = 5
+            elif span <= 14*24*3600:  interval = 15
+            elif span <= 60*24*3600:  interval = 60
+            elif span <= 180*24*3600: interval = 240
+            else:                     interval = 1440
+            return {"since": since, "interval": interval}
+        except Exception:
+            return {"since": now - 24*3600, "interval": 5}
+
+    # ---------------- setParams / realtime / indicatori (come prima) ----------------
+    def setParams(self, base: Optional[str] = None, range_str: Optional[str] = None,
+                  quote: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        if not hasattr(self, "_params"):
+            self._params = {"base": "BTC", "quote": "EUR", "range": "24H",
+                            "since": None, "until": None, "interval": 1}
+        if base:  self._params["base"] = base.upper()
+        if quote: self._params["quote"] = quote.upper()
+        if range_str:
+            rr = self._range_to_since_and_interval(range_str)
+            self._params.update({"range": range_str, **rr, "until": int(time.time())})
+        for k in ("since", "until", "interval"):
+            if k in kwargs and kwargs[k] is not None:
+                self._params[k] = int(kwargs[k])
+        self.pair_human = f"{self._params['base']}/{self._params['quote']}"
+        self.pair = self._norm_pair(self.pair_human)
+        print("[setParams]", self._params)
+        return dict(self._params)
+
+    def getRealtime(self, pair: Optional[str] = None, depth: int = 0) -> Dict[str, Any]:
+        p = self._norm_pair(pair or self.pair_human)
+        t = self._public("Ticker", {"pair": p})
+        if t.get("error"): raise RuntimeError("Ticker error: " + "; ".join(t["error"]))
+        tr = list(t["result"].values())[0]
+        bid, ask, last = float(tr["b"][0]), float(tr["a"][0]), float(tr["c"][0])
+        mid = (bid + ask) / 2.0; spread = ask - bid
+        out = {"pair": p, "bid": bid, "ask": ask, "last": last, "mid": mid, "spread": spread}
+        cur = self._cur(); cur.update_from_realtime(out)
+        out["currency"] = cur.to_dict(); out["currencies"] = self.cset.to_dicts()
+        return out
+
+    # ------- indicatori veloci (come prima, abbreviati) -------
+    @staticmethod
+    def _ema_last(values: list, period: int) -> float:
+        if not values: return 0.0
+        k = 2.0/(period+1.0); ema = values[0]
+        for v in values[1:]: ema = v*k + ema*(1.0-k)
+        return ema
+
+    @staticmethod
+    def _atr(candles, period: int = 14) -> float:
+        if len(candles) < 2: return 0.0
+        trs = []
+        for i in range(1, len(candles)):
+            h = float(candles[i][2]); l = float(candles[i][3]); pc = float(candles[i-1][4])
+            trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+        n = min(period, len(trs)); avg = sum(trs[:n]) / n
+        for tr in trs[n:]: avg = (avg*(period-1) + tr) / period
+        return avg
+
+    @staticmethod
+    def _vwap_global(candles) -> float:
+        num = den = 0.0
+        for c in candles:
+            tp = (float(c[2]) + float(c[3]) + float(c[4]))/3.0
+            v  = float(c[6]); num += tp*v; den += v
+        return (num/den) if den else 0.0
+
+    @staticmethod
+    def _classify_volume(candles) -> str:
+        from statistics import median
+        vols = [float(c[6]) for c in candles if len(c) > 6]
+        if not vols: return "Volume Low"
+        m = median(vols); avg = sum(vols)/len(vols)
+        if m <= 0: return "Volume Low" if avg <= 0 else "Volume High"
+        ratio = avg/m
+        return "Volume High" if ratio >= 1.5 else ("Volume Low" if ratio <= 0.75 else "Volume Medium")
+
+    # ---------------- ohlc_all / search / OR / OR-breakout (identiche nell'IO; interno usa _public ottim.) ----------------
+    def ohlc_all(self, interval: int = 1440, pair: Optional[str] = None, limit: Optional[int] = None) -> Dict[str, Any]:
+        p = self._norm_pair(pair or self.pair_human)
+        candles, since, loops = [], 0, 0
+        while True:
+            data = self._public("OHLC", {"pair": p, "interval": int(interval), "since": int(since)})
+            if data.get("error"): raise RuntimeError("OHLC(all) error: " + "; ".join(data["error"]))
+            chunk = data["result"].get(p, []); last = data["result"].get("last")
+            if not chunk: break
+            candles.extend(chunk)
+            if limit and len(candles) >= limit:
+                candles = candles[:limit]; break
+            if last is None or last == since: break
+            since = last; loops += 1
+            if loops > 5000: break
+        return {"candles": candles, "last": since}
+
+    def search(self) -> Dict[str, Any]:
+        p = dict(getattr(self, "_params", {}))
+        if not p.get("since"):
+            p.update(self._range_to_since_and_interval(p.get("range", "24H")))
+        use_all = str(p.get("range", "")).upper() in {"ALL", "MAX", "*"}
+        data = self.ohlc(interval=int(p["interval"]), since=int(p["since"])) if not use_all else self.ohlc_all(int(p["interval"]))
+        candles = data["candles"]
+        if not candles:
+            out = {"pair": self.pair_human, "n": 0, "message": "no candles"}
+            out["currencies"] = self.cset.to_dicts(); return out
+        o = float(candles[0][1]); h = max(float(c[2]) for c in candles)
+        l = min(float(c[3]) for c in candles); c_ = float(candles[-1][4])
+        vol = sum(float(cn[6]) for cn in candles)
+        change_pct = ((c_ - o) / o) * 100.0 if o else 0.0
+        change_dir = "UP" if change_pct > 0.01 else ("DOWN" if change_pct < -0.01 else "FLAT")
+        volume_label = self._classify_volume(candles)
+        out = {"pair": self.pair_human, "kr_pair": self.pair, "range": p.get("range"),
+               "since": int(p["since"]), "interval_min": int(p["interval"]), "n": len(candles),
+               "open": round(o,6), "close": round(c_,6), "change_pct": round(change_pct,4),
+               "change_dir": change_dir, "high": round(h,6), "low": round(l,6),
+               "volume": round(vol,6), "volume_label": volume_label}
+        cur = self._cur(); cur.update_from_search(out)
+        out["currency"] = cur.to_dict(); out["currencies"] = self.cset.to_dicts()
+        return out
+
+    # --- (mantenuti) computeOpeningRange / orBreakoutSignal / resetForNewSearch / applyFromTotalInfo ---
+    def _utc_day_start(self, ts: Optional[int] = None) -> int:
+        from datetime import datetime, timezone
+        if ts is None: ts = int(time.time())
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        zero = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+        return int(zero.timestamp())
+
+    def computeOpeningRange(self, or_minutes: int = 15) -> Dict[str, Any]:
+        day_start = self._utc_day_start()
+        data = self.ohlc(interval=1, since=day_start); candles = data["candles"]
+        if len(candles) < max(or_minutes, 2):
+            out = {"ok": False, "reason": "not enough candles since daily open"}
+            out["currencies"] = self.cset.to_dicts(); return out
+        first = candles[:or_minutes]
+        or_high = max(float(c[2]) for c in first); or_low = min(float(c[3]) for c in first)
+        or_rng = or_high - or_low; last_c = float(candles[-1][4])
+        cur = self._cur(); cur.update_or({"or_high": or_high, "or_low": or_low,
+                                          "or_range": or_rng, "day_start": day_start})
+        out = {"ok": True, "pair": self.pair_human, "day_start": day_start,
+               "or_minutes": or_minutes, "or_high": round(or_high,6), "or_low": round(or_low,6),
+               "or_range": round(or_rng,6), "last_close": round(last_c,6), "n_candles": len(candles)}
+        out["currency"] = cur.to_dict(); out["currencies"] = self.cset.to_dicts()
+        return out
+
+    def orBreakoutSignal(self, or_minutes: int = 15, retest: bool = True, retest_look: int = 5,
+                         buffer_bps: float = 5.0, use_realtime: bool = True) -> Dict[str, Any]:
+        or_info = self.computeOpeningRange(or_minutes=or_minutes)
+        if not or_info.get("ok"):
+            out = {"signal": "HOLD", "reason": or_info.get("reason", "OR not available")}
+            out["currencies"] = self.cset.to_dicts(); return out
+        or_high, or_low, or_rng = float(or_info["or_high"]), float(or_info["or_low"]), float(or_info["or_range"])
+        day_start = int(or_info["day_start"])
+        data = self.ohlc(interval=1, since=day_start); candles = data["candles"]
+        if len(candles) < or_minutes + 2:
+            out = {"signal": "HOLD", "reason": "not enough intraday data"}
+            out["currencies"] = self.cset.to_dicts(); return out
+        last_close = float(candles[-1][4]); prev_close = float(candles[-2][4])
+        px = self.getRealtime()["mid"] if use_realtime else last_close
+        def _buf(p,bps): return abs(p)*(bps/10_000.0)
+        buf_high, buf_low = or_high + _buf(or_high, buffer_bps), or_low - _buf(or_low, buffer_bps)
+        def _retest_ok(side: str) -> bool:
+            if not retest: return True
+            window = candles[-retest_look:] if retest_look>0 else [candles[-1]]
+            if side=="up":  return any(float(c[3]) <= buf_high for c in window) and float(window[-1][4])>or_high
+            else:           return any(float(c[2]) >= buf_low  for c in window) and float(window[-1][4])<or_low
+        signal, reason, sl, tp = "HOLD","inside OR",None,None
+        if prev_close <= or_high and last_close > or_high and _retest_ok("up"):
+            signal, reason, sl, tp = "BUY_LONG","Breakout above OR with acceptance", or_low, px+or_rng
+        elif prev_close >= or_low and last_close < or_low and _retest_ok("down"):
+            signal, reason, sl, tp = "SELL_SHORT","Breakout below OR with acceptance", or_high, px-or_rng
+        cur = self._cur()
+        cur.update_or({"or_high": or_high, "or_low": or_low, "or_range": or_rng, "day_start": day_start})
+        out = {"pair": self.pair_human, "strategy": "or_breakout", "signal": signal, "reason": reason,
+               "price": round(px,6), "or_high": round(or_high,6), "or_low": round(or_low,6),
+               "or_range": round(or_rng,6), "stop_suggested": round(sl,6) if sl is not None else None,
+               "takeprofit_suggested": round(tp,6) if tp is not None else None,
+               "params": {"or_minutes": or_minutes, "retest": retest, "retest_look": retest_look, "buffer_bps": buffer_bps}}
+        out["currency"] = cur.to_dict(); out["currencies"] = self.cset.to_dicts()
+        return out
+
+    def resetForNewSearch(self, pair: str = "BTC/EUR", range_str: str = "24H",
+                          interval: Optional[int] = None, reset_auth: bool = False,
+                          keep_currencies: bool = False) -> Dict[str, Any]:
+        if "/" in pair: base, quote = pair.upper().split("/",1)
+        else: base, quote = pair.upper(), "EUR"
+        rr = self._range_to_since_and_interval(range_str)
+        self._params = {"base": base, "quote": quote, "range": range_str,
+                        "since": rr["since"], "until": int(time.time()),
+                        "interval": int(interval if interval is not None else rr["interval"])}
+        self.pair_human = f"{base}/{quote}"; self.pair = self._norm_pair(self.pair_human)
+        if not keep_currencies: self.cset = Currencies()
+        if reset_auth: self.refresh_auth(verbose=False)
+        return {"pair": self.pair_human, "kr_pair": self.pair, "params": dict(self._params),
+                "auth_ok": getattr(self, "auth", None).ok if hasattr(self, "auth") else True,
+                "reset_auth": reset_auth, "keep_currencies": keep_currencies}
+
+    def clear(self, *args, **kwargs):  # alias
+        return self.resetForNewSearch(*args, **kwargs)
+
+    def applyFromTotalInfo(self, total_info: Dict[str, Any], range_str: str = "24H",
+                           interval: Optional[int] = None, use_clear: bool = False,
+                           sleep_sec: float = 0.15) -> Dict[str, Any]:
+        if isinstance(total_info, dict): rows = total_info.get("results", [])
+        elif isinstance(total_info, list): rows = total_info
+        else:
+            print("[applyFromTotalInfo] invalid input", type(total_info))
+            return {"range": range_str, "interval_min": None, "method": "clear" if use_clear else "setParams",
+                    "count": 0, "currencies": self.cset.to_dicts()}
+        if interval is None:
+            interval = int(self._range_to_since_and_interval(range_str)["interval"])
+        updated = 0
+        for row in rows:
+            try:
+                human = row["pair"]; kr_code = row.get("kr_pair")
+                if "/" not in human: continue
+                base, quote = human.split("/",1)
+                if kr_code: self._pair_cache[human.upper()] = kr_code
+                if use_clear: self.clear(human, range_str, interval=interval, keep_currencies=True)
+                else: self.setParams(base, range_str, quote=quote, interval=interval)
+                _ = self.search(); updated += 1
+                if sleep_sec: time.sleep(sleep_sec)
+            except Exception as e:
+                print(f"[applyFromTotalInfo] ERROR on {row.get('pair','?')}: {e}")
+        return {"range": range_str, "interval_min": int(interval),
+                "method": "clear" if use_clear else "setParams",
+                "count": updated, "currencies": self.cset.to_dicts()}
+
+    # ---------------- Liquidity / MTF helpers abbreviati (IO invariato) ----------------
+    def _order_book_raw(self, kr_code: str, depth: int = 25) -> Dict[str, Any]:
+        data = self._public("Depth", {"pair": kr_code, "count": int(depth)})
+        if data.get("error"): raise RuntimeError("Depth error: " + "; ".join(data["error"]))
+        return list(data["result"].values())[0]
+
+    def _liquidity_block(self, kr_pair: str, top_n: int = 5, budget_quote: float = 1000.0) -> dict:
+        data = self._public("Depth", {"pair": kr_pair, "count": int(top_n)})
+        if data.get("error"): raise RuntimeError("Depth error: " + "; ".join(data["error"]))
+        book = list(data["result"].values())[0]
+        bids = [(float(p), float(q)) for (p,q,*_) in book.get("bids",[])]
+        asks = [(float(p), float(q)) for (p,q,*_) in book.get("asks",[])]
+        if not bids and not asks:
+            return {"depth_used": top_n, "bid_sum":0.0, "ask_sum":0.0, "total_sum":0.0,
+                    "slippage_buy_pct": None, "slippage_sell_pct": None}
+        def _avg(levels, budget_q):
+            remain=budget_q; cost=qty=0.0
+            for px,q in levels:
+                take=min(q, remain/px);
+                cost+=take*px; qty+=take; remain-=take*px
+                if remain<=1e-9: break
+            return None if qty<=0 else cost/qty
+        best_bid=bids[0][0] if bids else None; best_ask=asks[0][0] if asks else None
+        ref=(best_bid+best_ask)/2.0 if (best_bid is not None and best_ask is not None) else (best_ask or best_bid)
+        avg_buy=_avg(asks,budget_quote); avg_sell=_avg(bids,budget_quote)
+        def _slip_buy(ref_px,avg_px): return None if (ref_px is None or avg_px is None) else (avg_px/ref_px-1.0)*100.0
+        def _slip_sell(ref_px,avg_px): return None if (ref_px is None or avg_px is None) else (1.0-avg_px/ref_px)*100.0
+        bid_sum=sum(q for _,q in bids[:top_n]); ask_sum=sum(q for _,q in asks[:top_n])
+        return {"depth_used": int(top_n), "bid_sum": bid_sum, "ask_sum": ask_sum,
+                "total_sum": bid_sum+ask_sum, "slippage_buy_pct": _slip_buy(ref,avg_buy),
+                "slippage_sell_pct": _slip_sell(ref,avg_sell)}
+
+    def _mtf_block(self, kr_code: str) -> dict:
+        def _calc(interval_min: int) -> tuple[float|None,float|None,str]:
+            data = self._public("OHLC", {"pair": kr_code, "interval": int(interval_min)})
+            if data.get("error"): raise RuntimeError("OHLC error: " + "; ".join(data["error"]))
+            candles = data["result"].get(kr_code, [])
+            closes = [float(c[4]) for c in candles][-250:]
+            if len(closes) < 200: return None, None, "FLAT"
+            ema50 = self._ema_last(closes, 50); ema200 = self._ema_last(closes, 200)
+            up_th = 1.001*ema200; down_th = 0.999*ema200
+            bias = "UP" if ema50>up_th else ("DOWN" if ema50<down_th else "FLAT")
+            return ema50, ema200, bias
+        e50_1h, e200_1h, bias_1h = _calc(60); e50_4h, e200_4h, bias_4h = _calc(240)
+        return {"ema50_1h": e50_1h, "ema200_1h": e200_1h, "bias_1h": bias_1h,
+                "ema50_4h": e50_4h, "ema200_4h": e200_4h, "bias_4h": bias_4h}
+
+
+
+    def _print_currency_full(self, cur) -> None:
+        """Stampa tutti i campi della Currency in modo leggibile (solo log)."""
+        try:
+            d = cur.to_dict()
+        except Exception:
+            return
+        print(f"[currency][full] ===== {cur.pair_human} =====")
+        for k in sorted(d.keys()):
+            v = d[k]
+            if isinstance(v, float):
+                try:
+                    v = round(v, 8)
+                except Exception:
+                    pass
+            print(f"  - {k}: {v}")
+        print("[currency][full] ============================\n")
+
+    def _hydrate_currency_from_candles(
+        self,
+        human_pair: str,
+        kr_code: str,
+        candles: list,
+        *,
+        range_str: str,
+        since: int,
+        interval: int,
+        with_ticker: bool = True,
+        ema_fast: int = 9,
+        ema_slow: int = 21,
+        atr_period: int = 14,
+    ):
+        """
+        Dato human_pair (es. 'AAVE/EUR'), kr_code (es. 'XXBTZEUR') e le candele OHLC,
+        calcola i principali campi e aggiorna/ritorna l'oggetto Currency corrispondente.
+        """
+        base, quote = human_pair.split("/", 1)
+
+        # --- riepilogo range dai candles
+        o = float(candles[0][1])
+        c = float(candles[-1][4])
+        h = max(float(x[2]) for x in candles)
+        l = min(float(x[3]) for x in candles)
+        vol_sum = sum(float(x[6]) for x in candles)
+        change_pct = ((c - o) / o) * 100.0 if o else 0.0
+        change_dir = "UP" if change_pct > 0.01 else ("DOWN" if change_pct < -0.01 else "FLAT")
+        volume_label = self._classify_volume(candles)
+
+        # --- indicatori rapidi dal range
+        closes = [float(x[4]) for x in candles]
+        ema_f = self._ema_last(closes, ema_fast)
+        ema_s = self._ema_last(closes, ema_slow)
+        atr_v = self._atr(candles, atr_period)
+        vwap_g = self._vwap_global(candles)
+
+        # --- dati realtime (opzionali)
+        bid = ask = last = mid = spread = None
+        if with_ticker:
+            try:
+                t = self._public("Ticker", {"pair": kr_code})
+                if t.get("error"):
+                    raise RuntimeError("; ".join(t["error"]))
+                tres = list(t["result"].values())[0]
+                bid = float(tres["b"][0])
+                ask = float(tres["a"][0])
+                last = float(tres["c"][0])
+                mid = (bid + ask) / 2.0
+                spread = ask - bid
+            except Exception as e:
+                print(f"[hydrate][ticker] WARN {human_pair}: {e}")
+
+        # --- aggiorna/crea la Currency
+        cur = self.cset.get_or_create(base, quote, kr_pair=kr_code)
+        cur.update_from_search({
+            "kr_pair": kr_code,
+            "range": range_str,
+            "since": int(since),
+            "interval_min": int(interval),
+            "open": o, "close": c,
+            "change_pct": change_pct,
+            "change_dir": change_dir,
+            "high": h, "low": l,
+            "volume": vol_sum, "volume_label": volume_label,
+        }).update_indicators(
+            vwap=vwap_g, ema_fast=ema_f, ema_slow=ema_s, atr=atr_v, volume_label=volume_label
+        )
+
+        if with_ticker and (bid is not None):
+            cur.update_from_ticker({
+                "pair": kr_code, "bid": bid, "ask": ask, "last": last, "mid": mid, "spread": spread
+            })
+
+        # log opzionale
+        self._print_currency_full(cur)
+        return cur
+
+
+    # ---------------- SCAN: getTotalInfo (più veloce/robusto, stessa firma/IO) ----------------
+    def getTotalInfo(self, range_str: str, quote: str = "EUR",
+                     max_pairs: int = 30, sleep_sec: float = 0.4,
+                     with_ticker: bool = True,
+                     with_or: bool = True, or_minutes: int = 15,
+                     with_liquidity: bool = True, depth_top_n: int = 5, liquidity_budget_quote: float = 1000.0,
+                     with_mtf: bool = True, enforce_or_quality: bool = True) -> Dict[str, Any]:
+
+        rr = self._range_to_since_and_interval(range_str)
+        since, interval = rr["since"], rr["interval"]
+
+        # AssetPairs (cached) → lista (kr_code,human)
+        ap = self._public("AssetPairs")
+        if ap.get("error"): raise RuntimeError("AssetPairs error: " + "; ".join(ap["error"]))
+        pairs: List[Tuple[str,str]] = []
+        for k,v in ap["result"].items():
+            ws = v.get("wsname")
+            if not ws or "/" not in ws: continue
+            base, q = ws.split("/",1)
+            if q.upper()!=quote.upper(): continue
+            kr_code = k
+            human = f"{('BTC' if base.upper()=='XBT' else base.upper())}/{q.upper()}"
+            pairs.append((kr_code, human))
+            self._pair_cache[human.upper()] = kr_code
+
+        priority = {"BTC","ETH"}
+        pairs.sort(key=lambda t: (0 if t[1].split('/')[0] in priority else 1, t[1]))
+        pairs = pairs[:max_pairs]
+
+        results: List[Dict[str,Any]] = []
+        day_start = self._utc_day_start() if with_or else None
+
+        for kr_code, human in pairs:
+            # OHLC del range
+            try:
+                data = self._public("OHLC", {"pair": kr_code, "interval": int(interval), "since": int(since)})
+            except Exception as e:
+                print(f"[getTotalInfo] skip {human}: {e}"); continue
+            candles = data["result"].get(kr_code, [])
+            if not candles:
+                print(f"[getTotalInfo] no candles for {human}"); continue
+
+            o = float(candles[0][1]); c = float(candles[-1][4])
+            change_pct = ((c - o) / o) * 100.0 if o else 0.0
+            direction = "UP" if change_pct>0.01 else ("DOWN" if change_pct<-0.01 else "FLAT")
+            vol_label = self._classify_volume(candles)
+
+            # OR 1m (una sola fetch per pair)
+            or_high = or_low = or_rng = None
+            if with_or and day_start is not None:
+                try:
+                    data_or = self._public("OHLC", {"pair": kr_code, "interval": 1, "since": int(day_start)})
+                    or_c = data_or["result"].get(kr_code, [])
+                    if len(or_c) >= max(or_minutes,2):
+                        first = or_c[:or_minutes]
+                        or_high = max(float(x[2]) for x in first)
+                        or_low  = min(float(x[3]) for x in first)
+                        or_rng  = or_high - or_low
+                except Exception as e:
+                    print(f"[getTotalInfo][OR] {human}: {e}")
+
+            # Idrata Currency (usa anche ticker, opzionale)
+            cur = self._hydrate_currency_from_candles(
+                human_pair=human, kr_code=kr_code, candles=candles,
+                range_str=range_str, since=since, interval=interval,
+                with_ticker=with_ticker, ema_fast=9, ema_slow=21, atr_period=14
+            )
+            if with_or and or_high is not None and or_low is not None and or_rng is not None:
+                cur.update_or({"or_high": or_high, "or_low": or_low, "or_range": or_rng, "day_start": int(day_start)})
+
+            # Qualità OR
+            or_ok = or_reason = None
+            if with_or and cur.or_range is not None:
+                if cur.or_range == 0: or_ok, or_reason = False, "OR range = 0"
+                elif cur.atr is not None and cur.or_range < 0.5 * float(cur.atr):
+                    or_ok, or_reason = False, "OR range < 0.5*ATR"
+                else:
+                    or_ok, or_reason = True, "OR ok"
+            setattr(cur, "or_ok", or_ok); setattr(cur, "or_reason", or_reason)
+
+            # Liquidità
+            if with_liquidity:
+                try:
+                    liq = self._liquidity_block(kr_code, top_n=depth_top_n, budget_quote=float(liquidity_budget_quote))
+                    if hasattr(cur, "update_liquidity"): cur.update_liquidity(liq)
+                    else:
+                        cur.liquidity_depth_used = liq.get("depth_used")
+                        cur.liquidity_bid_sum    = liq.get("bid_sum")
+                        cur.liquidity_ask_sum    = liq.get("ask_sum")
+                        cur.liquidity_total_sum  = liq.get("total_sum")
+                        cur.slippage_buy_pct     = liq.get("slippage_buy_pct")
+                        cur.slippage_sell_pct    = liq.get("slippage_sell_pct")
+                except Exception as e:
+                    print(f"[liquidity] WARN {cur.pair_human}: {e}")
+
+            # MTF
+            if with_mtf:
+                try:
+                    mtf = self._mtf_block(kr_code)
+                    if hasattr(cur, "update_mtf"): cur.update_mtf(mtf)
+                    else:
+                        cur.ema50_1h = mtf.get("ema50_1h"); cur.ema200_1h = mtf.get("ema200_1h"); cur.bias_1h = mtf.get("bias_1h")
+                        cur.ema50_4h = mtf.get("ema50_4h"); cur.ema200_4h = mtf.get("ema200_4h"); cur.bias_4h = mtf.get("bias_4h")
+                except Exception as e:
+                    print(f"[mtf] WARN {cur.pair_human}: {e}")
+
+            # Enforce qualità OR
+            if enforce_or_quality and with_or and getattr(cur, "or_ok", None) is False:
+                if sleep_sec: time.sleep(sleep_sec)
+                continue
+
+            results.append({
+                "pair": cur.pair_human, "kr_pair": cur.kr_pair,
+                "range": cur.range, "interval_min": cur.interval_min, "since": cur.since,
+                "open": round(cur.open or 0.0, 6), "close": round(cur.close or 0.0, 6),
+                "start_price": round(cur.open or 0.0, 6), "current_price": round(cur.close or 0.0, 6),
+                "change_pct": round(cur.change_pct or 0.0, 4), "direction": cur.change_dir,
+                "high": round((cur.high or 0.0),6), "low": round((cur.low or 0.0),6),
+                "volume": round((cur.volume or 0.0),6), "volume_label": cur.volume_label,
+                "bid": cur.bid, "ask": cur.ask, "last": cur.last, "mid": cur.mid, "spread": cur.spread,
+                "ema_fast": cur.ema_fast, "ema_slow": cur.ema_slow, "atr": cur.atr, "vwap": cur.vwap,
+                "or_high": cur.or_high, "or_low": cur.or_low, "or_range": cur.or_range, "day_start": cur.day_start,
+                "or_ok": getattr(cur, "or_ok", None), "or_reason": getattr(cur, "or_reason", None),
+                "liquidity_depth_used": getattr(cur, "liquidity_depth_used", None),
+                "liquidity_bid_sum": getattr(cur, "liquidity_bid_sum", None),
+                "liquidity_ask_sum": getattr(cur, "liquidity_ask_sum", None),
+                "liquidity_total_sum": getattr(cur, "liquidity_total_sum", None),
+                "slippage_buy_pct": getattr(cur, "slippage_buy_pct", None),
+                "slippage_sell_pct": getattr(cur, "slippage_sell_pct", None),
+                "ema50_1h": getattr(cur, "ema50_1h", None), "ema200_1h": getattr(cur, "ema200_1h", None),
+                "ema50_4h": getattr(cur, "ema50_4h", None), "ema200_4h": getattr(cur, "ema200_4h", None),
+                "bias_1h": getattr(cur, "bias_1h", None), "bias_4h": getattr(cur, "bias_4h", None),
+            })
+
+            if sleep_sec: time.sleep(sleep_sec)
+
+        results.sort(key=lambda x: (x["change_pct"] if x["change_pct"] is not None else -1e9), reverse=True)
+        return {"quote": quote.upper(), "range": range_str, "interval_min": int(interval),
+                "count": len(results), "results": results, "currencies": self.cset.to_dicts()}
+
+    # ---------- metodi per ordini (private) rimangono invariati nella firma ----------
+    # (per brevità, tieni i tuoi fetch_* già presenti; usano _private e _kr_to_human_pair_match)
+    # -------------------------------------------------------------------------------
+    # ...puoi mantenere i tuoi metodi updateOrdersForCurrency / updateOrdersForAllFromTotalInfo / _private
+    # senza cambi nella firma; sfrutteranno comunque la cache e il rate-limit di questa classe.

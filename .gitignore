@@ -1,0 +1,55 @@
+# === JSON: ignora tutto tranne weights.json ===
+*.json
+!**/weights.json
+
+# File "metajson" visti nel progetto (es. ETH_EUR.metajson)
+*.metajson
+
+# === Dataset / modelli / checkpoint ===
+*.csv
+*.tsv
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.txt
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+ENV/
+env/
+.eggs/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.coverage
+htmlcov/
+
+# === Log e cache generiche ===
+logs/
+*.log
+.cache/
+*.tmp
+
+# === Env / segreti ===
+.env
+.env.*
+!.env.example
+
+# === Editor / IDE ===
+.vscode/
+.idea/
+*.iml
+
+# === OS ===
+.DS_Store
+Thumbs.db
+Desktop.ini

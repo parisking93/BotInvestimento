@@ -1,0 +1,33 @@
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+combine_as_imports = true
+skip_gitignore = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+fix = true
+unsafe-fixes = false
+select = [
+  "E",   # pycodestyle
+  "F",   # pyflakes
+  "I",   # isort (ordinamento import)
+  "UP",  # python upgrades
+  "B",   # flake8-bugbear
+  "C4",  # comprehensions
+]
+ignore = [
+  "E203",  # compat con Black sugli slice
+]
+[tool.ruff.lint]
+# (alias della vecchia chiave; lasciato per compat compat)
+
+[tool.ruff.format]
+# Usa il formatter stile Black interno di Ruff *solo* per formattazione rapida
+quote-style = "double"
+indent-style = "space"

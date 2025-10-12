@@ -1,0 +1,8 @@
+    for actf in bodies:
+        print(actf)
+
+    for res in test:
+        if res.get('error'):
+            print("❌", res['error'])
+        else:
+            print("✅ txid:", res['result'].get('txid'), "->", res['result']['descr']['order'])
