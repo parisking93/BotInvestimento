@@ -53,6 +53,252 @@ def floor_dec(x: float, n: int) -> float:
     return math.floor(x * f) / f
 
 # --- helper: da mettere in alto nel file Aiensemble.py (vicino ad altri util) ---
+
+# ======== GOAL TRACKER (daily/weekly PnL) + EXPOSURE CONTEXT ========
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+GOAL_STATE_PATH = os.path.join(os.getcwd(), "aiConfig", "goal_state.json")
+
+
+
+GOAL_JOURNAL_PATH = os.path.join(os.getcwd(), "aiConfig", "goal_journal.json")
+
+class GoalJournal:
+    """
+    Registra per ciascun giorno gli ID dei trade SELL già conteggiati nel PnL.
+    Schema:
+    {
+      "2025-10-12": {
+         "seen_ids": {"BTCEUR": ["TID1","TID2"], "ETHEUR": [...]},
+         "pnl_added": 12.34
+      }
+    }
+    """
+    def __init__(self, path: str = GOAL_JOURNAL_PATH):
+        self.path = path
+        self.state = self._load()
+
+    def _load(self):
+        try:
+            return safe_read_json(self.path) or {}
+        except Exception:
+            return {}
+
+    def _save(self):
+        try:
+            safe_write_json(self.path, self.state)
+        except Exception:
+            pass
+
+    def today_key(self) -> str:
+        return datetime.utcnow().date().isoformat()
+
+    def get_seen(self, day: str) -> dict:
+        d = self.state.setdefault(day, {})
+        return d.setdefault("seen_ids", {})
+
+    def mark_seen_and_add_pnl(self, day: str, pair: str, new_ids: list[str], pnl_delta: float):
+        seen = self.get_seen(day)
+        bucket = seen.setdefault(pair, [])
+        # append solo gli ID non presenti
+        present = set(bucket)
+        for tid in new_ids:
+            if tid not in present:
+                bucket.append(tid)
+        # aggiorna pnl_added
+        d = self.state.setdefault(day, {})
+        d["pnl_added"] = float(d.get("pnl_added", 0.0)) + float(pnl_delta or 0.0)
+        self._save()
+
+    def get_seen_global(self, day: str) -> set:
+        d = self.state.setdefault(day, {})
+        gl = d.setdefault("seen_global", [])
+        return set(gl)
+
+    def mark_seen_global(self, day: str, new_ids: list[str]):
+        d = self.state.setdefault(day, {})
+        gl = d.setdefault("seen_global", [])
+        present = set(gl)
+        for tid in new_ids:
+            if tid not in present:
+                gl.append(tid)
+        self._save()
+
+
+@dataclass
+class GoalConfig:
+    daily_pnl_target_eur: float = 20.0
+    weekly_pnl_target_eur: float = 100.0
+    near_target_pct: float = 0.85   # quando considerare "near_*_target"
+    urgency_max_boost: float = 0.35 # quanto alzare aggressività/sizing se in ritardo
+
+class GoalTracker:
+    """
+    Tiene il conto di PnL realizzato oggi e questa settimana + fattore 'urgenza'
+    salvando su file per persistere tra le run.
+    """
+    def __init__(self, cfg: GoalConfig, state_path: str = GOAL_STATE_PATH):
+        self.cfg = cfg
+        self.path = state_path
+        self.state = self._load()
+
+    def _today_key(self):
+        d = datetime.utcnow().date()
+        return d.isoformat()
+
+    def _week_key(self):
+        today = datetime.utcnow().date()
+        monday = today - timedelta(days=today.weekday())
+        return f"{monday.isoformat()}_W"
+
+    def _load(self):
+        try:
+            return safe_read_json(self.path) or {}
+        except Exception:
+            return {}
+
+    def _save(self):
+        try:
+            safe_write_json(self.path, self.state)
+        except Exception:
+            pass
+
+    def add_realized_pnl(self, pnl_eur: float):
+        t, w = self._today_key(), self._week_key()
+        self.state.setdefault("daily", {}).setdefault(t, 0.0)
+        self.state.setdefault("weekly", {}).setdefault(w, 0.0)
+        self.state["daily"][t] += float(pnl_eur or 0.0)
+        self.state["weekly"][w] += float(pnl_eur or 0.0)
+        self._save()
+
+    def progress(self):
+        t, w = self._today_key(), self._week_key()
+        d = float((self.state.get("daily", {}).get(t) or 0.0))
+        wk = float((self.state.get("weekly", {}).get(w) or 0.0))
+        return {
+            "daily_now": d,
+            "weekly_now": wk,
+            "daily_target": float(self.cfg.daily_pnl_target_eur),
+            "weekly_target": float(self.cfg.weekly_pnl_target_eur),
+            "daily_near": (d >= self.cfg.near_target_pct * self.cfg.daily_pnl_target_eur),
+            "weekly_near": (wk >= self.cfg.near_target_pct * self.cfg.weekly_pnl_target_eur),
+        }
+
+    def urgency_factor(self) -> float:
+        """
+        0..1: 0 se siamo oltre target giornaliero, cresce verso 1 se siamo indietro.
+        Usata per boostare soglie/size in modo dolce.
+        """
+        p = self.progress()
+        # quanto manca al daily rispetto al target (clip 0..1)
+        gap = max(0.0, (p["daily_target"] - p["daily_now"])) / max(1e-6, p["daily_target"])
+        return float(np.clip(gap, 0.0, 1.0))
+
+class ExposureContext:
+    """
+    Calcola esposizione netta per pair (posizione + ordini aperti).
+    """
+    def __init__(self, min_order_eur: float = 35.0):
+        self.min_order_eur = float(min_order_eur)
+
+    def build_for(self, currencies: list[dict]) -> dict[str, dict]:
+        out = {}
+        for cur in currencies or []:
+            pair = cur.get("pair") or cur.get("kr_pair")
+            if not pair:
+                continue
+            now = ((cur.get("info") or {}).get("NOW") or {})
+            px = float(now.get("current_price") or now.get("last") or 0.0)
+            pos = ((cur.get("portfolio") or {}).get("position") or {}) or {}
+            q_base = float(pos.get("base") or 0.0)
+            exposure_base = q_base
+            # open orders delta (buy => +, sell => -)
+            oo = cur.get("open_orders") or []
+            for o in oo:
+                try:
+                    side = (o.get("type") or o.get("side") or "").lower()
+                    vol = float(o.get("volume") or o.get("qty") or 0.0)
+                    if side == "buy":  exposure_base += vol
+                    elif side == "sell": exposure_base -= vol
+                except Exception:
+                    continue
+            out[pair] = {
+                "price": px,
+                "pos_base": q_base,
+                "exposure_base_with_orders": exposure_base,
+                "exposure_eur_with_orders": exposure_base * px if px > 0 else 0.0,
+                "has_open_orders": bool(oo),
+            }
+        return out
+
+
+
+# ====== RESISTENZE: loader + feature builder ======
+RES_STATE_PATH = os.path.join(os.getcwd(), "ai_features_state.json")
+_RES_IDX = None  # cache
+
+_RES_RANGES = ["6H", "24H", "48H", "7D", "1M", "6M", "1Y"]
+_RES_FEATNAMES = sum([[f"dist_top_{r}", f"dist_bot_{r}", f"bandw_{r}", f"pos_in_band_{r}"] for r in _RES_RANGES], [])
+
+def _index_res_state(state: dict) -> dict:
+    """state['per_currency'][pair] -> list of {ts, max_resistance, min_support}  ==>  dict[pair][ts]=(top,bot)"""
+    out = {}
+    for pair, items in (state.get("per_currency") or {}).items():
+        d = {}
+        for it in items or []:
+            ts = it.get("ts")
+            if not ts:
+                continue
+            d[ts] = (it.get("max_resistance"), it.get("min_support"))
+        out[pair] = d
+    return out
+
+def _ensure_res_index(path: str = RES_STATE_PATH) -> dict:
+    global _RES_IDX
+    if _RES_IDX is not None:
+        return _RES_IDX
+    try:
+        state = safe_read_json(path)
+    except Exception:
+        state = {}
+    _RES_IDX = _index_res_state(state)
+    return _RES_IDX
+
+def _pair_from_row(row: dict) -> str:
+    p = row.get("pair")
+    if p:
+        return p
+    b = row.get("base"); q = row.get("quote")
+    if b and q:
+        return f"{b}/{q}"
+    return str(p or "")
+
+def resistance_features_for_row(row: dict, price_now: float) -> np.ndarray:
+    """Restituisce 4*len(_RES_RANGES) features (ordine fisso in _RES_FEATNAMES). NaN -> 0."""
+    idx = _ensure_res_index()
+    pair = _pair_from_row(row)
+    lvls = idx.get(pair, {})
+    out_vals: List[float] = []
+    for R in _RES_RANGES:
+        top, bot = (None, None)
+        if R in lvls:
+            t, b = lvls[R]
+            top = float(t) if isinstance(t, (int, float)) else None
+            bot = float(b) if isinstance(b, (int, float)) else None
+
+        band = (top - bot) if (top is not None and bot is not None) else None
+
+        dist_top = (price_now - top) / price_now if (top is not None and price_now) else np.nan
+        dist_bot = (price_now - bot) / price_now if (bot is not None and price_now) else np.nan
+        bandw    = (band / price_now)          if (band is not None and price_now) else np.nan
+        pos      = ((price_now - bot) / (band + 1e-12)) if (band is not None and bot is not None) else np.nan
+
+        out_vals += [dist_top, dist_bot, bandw, pos]
+
+    # safe -> 0.0
+    return np.array([0.0 if (v is None or np.isnan(v)) else float(v) for v in out_vals], dtype=float)
+
 def _make_regular_timeseries_from_df(df, freq="min"):
     import pandas as pd
     from darts import TimeSeries
@@ -151,16 +397,15 @@ def features_mtf_from_row(row: Dict[str, Any]) -> np.ndarray:
     info = (row.get("info") or {})
     now = (info.get("NOW") or {})
     px = float(now.get("current_price") or now.get("last") or now.get("close") or now.get("open") or 0.0)
-    # qualità mercato
+
+    # --- features già presenti (tue) ---
     spread = float(now.get("spread") or 0.0)
     spread_ratio = spread / (abs(px) + 1e-12)
     slip_b = float(now.get("slippage_buy_pct") or 0.0)
     slip_s = float(now.get("slippage_sell_pct") or 0.0)
     slip_avg = 0.5 * (slip_b + slip_s)
-    # OR
     or_ok = 1.0 if bool(now.get("or_ok")) else 0.0
-    or_high = now.get("or_high")
-    or_low = now.get("or_low")
+    or_high = now.get("or_high"); or_low = now.get("or_low")
     if or_high is not None and or_low is not None and (or_high - or_low) != 0:
         or_mid = 0.5 * (float(or_high) + float(or_low))
         or_rng = float(or_high) - float(or_low)
@@ -168,32 +413,30 @@ def features_mtf_from_row(row: Dict[str, Any]) -> np.ndarray:
         or_w = or_rng / (abs(px) + 1e-12)
     else:
         or_pos, or_w = 0.0, 0.0
-    # bias
     b1 = 1.0 if now.get("bias_1h") == "UP" else (-1.0 if now.get("bias_1h") == "DOWN" else 0.0)
     b4 = 1.0 if now.get("bias_4h") == "UP" else (-1.0 if now.get("bias_4h") == "DOWN" else 0.0)
-    # trend locale
-    ema50_1h = float(now.get("ema50_1h") or 0.0)
-    ema200_1h = float(now.get("ema200_1h") or 0.0)
-    ema50_4h = float(now.get("ema50_4h") or 0.0)
-    ema200_4h = float(now.get("ema200_4h") or 0.0)
+    ema50_1h = float(now.get("ema50_1h") or 0.0); ema200_1h = float(now.get("ema200_1h") or 0.0)
+    ema50_4h = float(now.get("ema50_4h") or 0.0); ema200_4h = float(now.get("ema200_4h") or 0.0)
     dev_1h = math.tanh((ema50_1h - ema200_1h) / (abs(ema200_1h) + 1e-9)) if ema200_1h else 0.0
     dev_4h = math.tanh((ema50_4h - ema200_4h) / (abs(ema200_4h) + 1e-9)) if ema200_4h else 0.0
-    # ritorni recenti
-    b24 = (info.get("24H") or {})
-    b48 = (info.get("48H") or {})
+    b24 = (info.get("24H") or {}); b48 = (info.get("48H") or {})
     ch24 = float(b24.get("change_pct") or 0.0)
     ch48 = float(b48.get("change_pct") or 0.0)
-    # volatilità
     b1h = (info.get("1H") or info.get("60M") or {})
     atr1h = float(b1h.get("atr") or 0.0)
-    # deviazione da EMA lenta
     ema_slow = float(now.get("ema_slow") or 0.0)
     vol_dev = math.tanh((px - ema_slow) / (abs(ema_slow) + 1e-9)) if ema_slow else 0.0
-    vec = np.array([
+
+    base_vec = np.array([
         ch24, ch48, dev_1h, dev_4h, vol_dev, atr1h, b1, b4,
         spread_ratio, slip_avg, or_ok, or_pos, or_w
     ], dtype=float)
-    return vec
+
+    # --- NUOVE feature: resistenze multi-orizzonte ---
+    res_vec = resistance_features_for_row(row, px)
+
+    return np.concatenate([base_vec, res_vec], axis=0)
+
 
 
 # ============================
@@ -1752,7 +1995,7 @@ class SqueezeBreakoutStrategy(Strategy):
 class WeightConfig:
     lr: float = 0.48
     decay: float = 0.97
-    temp: float = 1.6
+    temp: float = 1.8
     jitter: float = 1e-3
     # NUOVI (opzionali, hanno default):
     reward_scale: float = 50.0   # scala del PnL prima della tanh
@@ -1852,9 +2095,11 @@ class AdaptiveWeights:
         self.perf_ema = self.cfg.decay * self.perf_ema + (1 - self.cfg.decay) * perf_centered
         self.perf_ema = np.clip(self.perf_ema, -1.0, 1.0)
 
+        # --- NEW: decay leggero dei raw per non "fissarli" in alto ---
+        self.raw *= 0.995
         # update moltiplicativo con clip più “alto”
         self.raw *= np.exp(self.cfg.lr * self.perf_ema)
-        self.raw = np.clip(self.raw, self.cfg.min_raw, self.cfg.max_raw)
+        self.raw = np.clip(self.raw * (1.0 + self.perf_ema), self.cfg.min_raw, self.cfg.max_raw)
 
         # se saturato al floor e piatto → reset
         self._repair_if_degenerate()
@@ -1884,9 +2129,9 @@ class AIEnsembleTrader:
                  debug_signals: bool = False,
                  # policy allocator
                  capital_manager: bool = True,
-                 enter_thr: float = 0.42,
-                 exit_thr: float = -0.32,
-                 strong_thr: float = 0.6,
+                 enter_thr: float = 0.56,
+                 exit_thr: float = -0.46,
+                 strong_thr: float = 0.7,
                  use_market_for_strong: bool = True,
                  min_order_eur: float = 35.0,
                  respect_pair_limits: bool = True,
@@ -1957,7 +2202,14 @@ class AIEnsembleTrader:
         neural._use_torch = True
         self.planner_cfg = PlannerConfig()
         self._run_memory = {}   # per ricordare azioni già emesse nella run (pair -> dict)
-
+        # ---- GOALS & EXPOSURE (trasversali a tutte le strategie)
+        self.goal_cfg = GoalConfig(
+            daily_pnl_target_eur=float(getattr(self, "daily_pnl_target_eur", 2.0) or 2.0),
+            weekly_pnl_target_eur=float(getattr(self, "weekly_pnl_target_eur", 20.0) or 20.0),
+        )
+        self.goal = GoalTracker(self.goal_cfg)
+        self.exposure = ExposureContext(min_order_eur=self.min_order_eur)
+        self.goal_journal = GoalJournal()   # NEW
         self.enable_margin_short = getattr(self, "enable_margin_short", True)  # short OFF di default
         self.take_profit_pct     = getattr(self, "take_profit_pct", 0.01)       # TP 1% sopra il prezzo medio (esempio)
         self.exit_frac_default   = getattr(self, "exit_frac_default", 0.33)     # frazione di uscita spot
@@ -2146,6 +2398,179 @@ class AIEnsembleTrader:
         self._session_quote_left -= x
         return True
 
+    def _day_start_ts(self) -> float:
+        d = datetime.utcnow().date()
+        return datetime(d.year, d.month, d.day).timestamp()
+
+    def update_goal_from_trades_incremental(self, currencies: list[dict], actions_ai: List[Dict[str, Any]]) -> float:
+        """
+        Idempotente: somma al goal solo i trade 'nuovi' di oggi (in EUR) che REALIZZANO PnL:
+        - SELL: chiusura/riduzione di posizioni long
+        - BUY : chiusura/riduzione di posizioni short (margin/futures) -> lev>0 o qty_now<0 o reduce_only=true
+        Usa goal_journal per non contare due volte lo stesso trade.
+        Ritorna il pnl_delta aggiunto in questa chiamata.
+        """
+        day = self.goal_journal.today_key()
+        seen = self.goal_journal.get_seen(day)
+        seen_global = self.goal_journal.get_seen_global(day)
+        day_start = self._day_start_ts()
+        pnl_delta_total = 0.0
+
+        for cur in (currencies or []):
+            pair = (cur.get("pair") or cur.get("kr_pair") or "").upper()
+            if not pair:
+                continue
+
+            trades = ((cur.get("portfolio") or {}).get("trades") or [])
+            row    = ((cur.get("portfolio") or {}).get("row") or {})
+            now    = ((cur.get("info") or {}).get("NOW") or {})
+
+            # ---- qty attuale (post-snapshot) per inferire short/long
+            def _f(v):
+                try: return float(v)
+                except Exception: return 0.0
+            qty_now = _f(row.get("qty") or row.get("qtty") or row.get("q") or 0.0)
+
+            # ---- prezzi medi in EUR per unità base (se disponibili)
+            avg_buy_eur  = None
+            avg_sell_eur = None
+            # buy (costo medio di carico long)
+            for k in ("avg_buy_EUR","avg_buy_eur","avg_price_EUR","avg_price_eur","avg_buy"):
+                v = row.get(k)
+                if v is not None:
+                    try: avg_buy_eur = float(v); break
+                    except Exception: pass
+            # sell (prezzo medio di vendita short) – se il tuo snapshot lo espone
+            for k in ("avg_sell_EUR","avg_sell_eur","avg_short_EUR","avg_short_eur"):
+                v = row.get(k)
+                if v is not None:
+                    try: avg_sell_eur = float(v); break
+                    except Exception: pass
+
+            # fallback prudente al prezzo corrente se i medi non ci sono/sono assurdi
+            px_now = 0.0
+            try:
+                px_now = float(now.get("current_price") or now.get("last") or 0.0)
+            except Exception:
+                px_now = 0.0
+            if avg_buy_eur is None or avg_buy_eur <= 0 or (px_now > 0 and avg_buy_eur < px_now * 1e-4):
+                avg_buy_eur = px_now
+            if avg_sell_eur is None or avg_sell_eur <= 0 or (px_now > 0 and avg_sell_eur < px_now * 1e-4):
+                avg_sell_eur = px_now
+
+            seen_pair = set(seen.get(pair, []))
+            new_ids: list[str] = []
+            pnl_pair_delta = 0.0
+
+            for t in trades:
+                try:
+                    side = str(t.get("type") or "").lower()
+                    # --- NORMALIZZA E FILTRA PER PAIR ---
+                    def _norm_pair(x: str) -> str:
+                        return str(x or "").replace("_", "/").upper()
+
+                    cur_pair = cur.get('kr_pair') or f"{cur.get('base')}{cur.get('quote')}"
+
+                    # prova a leggere il pair dal trade (varie chiavi possibili)
+                    t_pair = _norm_pair(
+                        t.get("pair")
+                        or t.get("kr_pair")
+                        or t.get("pair_dec")
+                        or t.get("pairname")
+                        or t.get("assetPair")
+                    )
+
+                    # se il trade non ha pair o non combacia con quello corrente -> SKIP
+                    if not t_pair or (t_pair and t_pair != cur_pair):
+                        continue
+
+                    # --- decide se questo trade REALIZZA PnL ---
+                    # SELL realizza (riduce/chiude long)
+                    realizes = (side == "sell")
+                    # BUY realizza se è riduzione short: qty_now < 0 oppure leva > 0 oppure reduce_only
+                    lev_raw = t.get("leverage")
+                    try: lev_num = float(lev_raw)
+                    except Exception: lev_num = 0.0
+                    reduce_only = bool(t.get("reduce_only") or t.get("reduceOnly") or False)
+                    if (side == "buy") and (qty_now < 0 or lev_num > 0 or reduce_only):
+                        realizes = True
+
+                    if not realizes:
+                        continue
+
+                    tid = str(t.get("ordertxid") or t.get("trade_id") or t.get("txid") or "")
+                    if not tid or tid in seen_pair or tid in seen_global:
+                        continue
+
+                    ts = float(t.get("time") or 0.0)
+                    if ts < day_start:
+                        continue
+
+                    vol = float(t.get("vol") or t.get("volume") or 0.0)   # base qty
+                    if vol <= 0:
+                        continue
+
+                    price = float(t.get("price") or 0.0)                  # EUR per base (se presente)
+                    cost  = float(t.get("cost")  or (price * vol))        # EUR incassati (SELL) o spesi (BUY)
+                    fee   = float(t.get("fee")   or 0.0)                  # EUR fee
+                    if cost <= 0:
+                        continue
+
+                    # --- PnL in EUR ---
+                    if side == "sell":
+                        # chiusura/riduzione LONG: proceeds - basis_buy - fee
+                        basis_eur = vol * float(avg_buy_eur or 0.0)
+                        pnl = cost - basis_eur - fee
+                    else:
+                        # BUY che chiude SHORT: basis_sell - cost - fee  (basis = prezzo medio di vendita short)
+                        basis_eur = vol * float(avg_sell_eur or px_now or price)
+                        pnl = basis_eur - cost - fee
+
+                    # guard-rails contro outlier/dati incoerenti
+                    if not np.isfinite(pnl) or abs(pnl) > 5.0 * max(cost, 1e-12):
+                        # fallback: usa prezzo corrente come base (=> PnL ~ ±fee)
+                        if side == "sell":
+                            basis_eur = vol * (px_now or price)
+                            pnl = cost - basis_eur - fee
+                        else:
+                            basis_eur = vol * (px_now or price)
+                            pnl = basis_eur - cost - fee
+                        if not np.isfinite(pnl) or abs(pnl) > 5.0 * max(cost, 1e-12):
+                            pnl = -fee  # estremo conservativo
+
+                    pnl_pair_delta += float(pnl)
+                    new_ids.append(tid)
+
+                except Exception:
+                    continue
+
+            if new_ids:
+                self.goal_journal.mark_seen_and_add_pnl(day, pair, new_ids, pnl_pair_delta)
+                self.goal_journal.mark_seen_global(day, new_ids)
+                pnl_delta_total += pnl_pair_delta
+
+        # ---- aggiorna GoalTracker + pesi (con shaping in base all'urgenza)
+        if pnl_delta_total != 0.0:
+            try:
+                self.goal.add_realized_pnl(float(pnl_delta_total))
+            except Exception:
+                pass
+
+            urg = float(self.goal.urgency_factor())           # 0..1
+            shaped = float(pnl_delta_total) * (1.0 + 0.2 * urg)
+
+            # contributi pesati dai segnali del batch corrente
+            try:
+                contrib = self._aggregate_strategy_contrib(actions_ai)
+            except Exception:
+                contrib = None
+            if contrib is None:
+                contrib = np.zeros_like(self.weights.raw)
+
+            self.weights.update(contrib_w=contrib, realized_pnl=shaped)
+
+        return float(pnl_delta_total)
+
 
 
     def _enforce_min_constraints(self, cur: Dict[str, Any], price: float, raw_qty: float) -> Tuple[bool, float, str]:
@@ -2243,6 +2668,49 @@ class AIEnsembleTrader:
             px = ask if ask is not None else (last if last is not None else None)
         return self._round_price(limits, px)
 
+
+    def _realized_pnl_today_sell_only(self, currencies: list[dict]) -> float:
+        """
+        Stima PnL REALIZZATO oggi: considera solo i SELL di oggi
+        e li confronta con l'avg_buy corrente della posizione.
+        Approccio euristico ma stabile per il goal.
+        """
+        day_start = self._day_start_ts()
+        pnl = 0.0
+        for cur in (currencies or []):
+            port = (cur.get("portfolio") or {})
+            row  = (port.get("row") or {})  # qui spesso hai avg_buy, qty, ecc.
+            avg_buy = None
+            try:
+                avg_buy = float(row.get("avg_buy")) if row.get("avg_buy") is not None else None
+            except Exception:
+                avg_buy = None
+
+            now = ((cur.get("info") or {}).get("NOW") or {})
+            # fall back prudente: se non c'è avg_buy, usa current_price (PnL≈0 su vendite molto recenti)
+            if avg_buy is None:
+                try:
+                    avg_buy = float(now.get("current_price") or now.get("last") or 0.0)
+                except Exception:
+                    avg_buy = 0.0
+
+            trades = (port.get("trades") or [])
+            for t in trades:
+                try:
+                    ts   = float(t.get("time") or 0.0)
+                    if ts < day_start:  # solo oggi
+                        continue
+                    side = (t.get("type") or "").lower()
+                    if side != "sell":
+                        continue
+                    vol  = float(t.get("vol") or t.get("volume") or 0.0)
+                    px   = float(t.get("price") or t.get("cost", 0.0) / max(vol, 1e-12))
+                    fee  = float(t.get("fee") or 0.0)
+                    # PnL stimato su questa vendita
+                    pnl += (px - float(avg_buy or 0.0)) * vol - fee
+                except Exception:
+                    continue
+        return float(pnl)
 
     # -------------------- signals/blend --------------------
 
@@ -2422,7 +2890,7 @@ class AIEnsembleTrader:
         lo, hi = max(1e-6, self.enter_thr), max(self.enter_thr + 1e-6, self.strong_thr)
         x = np.clip((b - lo) / (hi - lo), 0.0, 1.0)
         scale = float(1 / (1 + np.exp(-6 * (x - 0.5))))
-        return float(self.per_trade_cap_eur * max(0.25, scale))
+        return float(self.per_trade_cap_eur * max(0.15, scale))
 
     def _mk_market_action(self, pair, side, qty, price_now, tf, motivo, meta):
         # ritorna il VECCHIO SCHEMA completo
@@ -3033,6 +3501,20 @@ class AIEnsembleTrader:
                     sells_pool.append((float(blend), cur, float(price)))
                 scored.append((float(blend), cur))
 
+            # ---- NEW: goal progress + exposure context (una volta per batch)
+            gprog = self.goal.progress()
+            exp_ctx = self.exposure.build_for(self._currencies)
+
+            for cur in self._currencies:
+                pair = cur.get("pair") or cur.get("kr_pair")
+                if not pair:
+                    continue
+                # annotazioni per il planner/strategie
+                cur["near_daily_target"]  = bool(gprog["daily_near"])
+                cur["near_weekly_target"] = bool(gprog["weekly_near"])
+                cur["_goal_urgency"] = float(self.goal.urgency_factor())  # 0..1
+                cur["_exposure"] = exp_ctx.get(pair, {})
+
             scored.sort(key=lambda x: x[0], reverse=True)
             for blend, cur in scored:
                 now = cur.get("info", {}).get("NOW", {})
@@ -3187,8 +3669,13 @@ class AIEnsembleTrader:
 
 
         actions_out = self.suggest_all()
-        out = {"scores": self.weights.scores(), "actions_ai": actions_out}
+        out = {
+            "scores": self.weights.scores(),
+            "actions_ai": actions_out,
+            "goal_progress": self.goal.progress(),  # NEW
+        }
         if self.output_dir: self.export_output(actions_out)
+
         return out
 
     # -------------------- >>> CREDIT ASSIGNMENT helper --------------------
@@ -3227,6 +3714,12 @@ class AIEnsembleTrader:
         """
         contrib = self._aggregate_strategy_contrib(actions_ai)
         self.weights.update(contrib_w=contrib, realized_pnl=float(realized_pnl_eur or 0.0))
+
+        try:
+            self.goal.add_realized_pnl(float(realized_pnl_eur or 0.0))
+        except Exception:
+            pass
+
         return {
             "names": [s.name for s in self.strategies],
             "contrib_vector": contrib.tolist(),
@@ -3234,44 +3727,42 @@ class AIEnsembleTrader:
             "weights_softmax_after": softmax(self.weights.raw, temp=self.weights.cfg.temp).tolist(),
         }
 
-    def update_weights_from_kraken(self,
-                                   actions_ai: List[Dict[str, Any]],
-                                   lookback_hours: int = 24) -> Dict[str, Any]:
-        """
-        Calcola PnL EUR sugli ultimi N hours dai Ledgers (cash flow) e
-        aggiorna i pesi usando un vettore di contributi derivato dalle azioni_ai.
-        """
+    def update_weights_from_kraken(self, actions_ai: List[Dict[str, Any]], lookback_hours: int = 24) -> Dict[str, Any]:
+        # 1) (facoltativo) tieni pure la lettura kraken se ti serve altrove,
+        #    ma NON usarla per il goal:
         k = self._get_kraken_api_from_env()
         end_ts = int(time.time()); start_ts = end_ts - int(lookback_hours * 3600)
 
-        pnl_total = 0.0
+        # 2) PnL per i pesi — puoi continuare a usare i ledger come "feedback grezzo" se ti piace,
+        #    ma io suggerisco di usare lo stesso segnale del goal per coerenza:
+        pnl_goal = self._realized_pnl_today_sell_only(self._currencies)
+
+        self._last_kraken_pnl_eur = float(pnl_goal)
+
+        # contributi pesati dai segnali
+        contrib = self._aggregate_strategy_contrib(actions_ai)
+
+        # opzionale: urgenza per shaping
+        urg = float(self.goal.urgency_factor())
+        shaped_pnl = float(pnl_goal or 0.0) * (1.0 + 0.5 * urg)  # k=0.5 come avevi
+        self.weights.update(contrib_w=contrib, realized_pnl=shaped_pnl)
+
+        # 3) aggiorna il goal con il PnL "realizzato oggi"
         try:
-            led = k.query_private("Ledgers", {"start": start_ts, "end": end_ts})
-            ledger = (led.get("result") or {}).get("ledger") or {}
-            for _, row in (ledger or {}).items():
-                asset = (row.get("asset") or "").upper()
-                try: amt = float(row.get("amount") or 0.0)
-                except Exception: amt = 0.0
-                if asset in {"ZEUR", "EUR"}:
-                    pnl_total += amt
+            self.goal.add_realized_pnl(float(pnl_goal or 0.0))
         except Exception:
             pass
 
-        self._last_kraken_pnl_eur = float(pnl_total)
-
-        # >>> qui la differenza: contributi NON uniformi
-        contrib = self._aggregate_strategy_contrib(actions_ai)
-        self.weights.update(contrib_w=contrib, realized_pnl=pnl_total)
         w_after = softmax(self.weights.raw, temp=self.weights.cfg.temp)
-
         return {
             "names": [s.name for s in self.strategies],
             "contrib_vector": contrib.tolist(),
-            "pnl_total_eur": float(pnl_total),
+            "pnl_total_eur": float(pnl_goal),
             "weights_softmax_after": w_after.tolist(),
             "kraken_window": {"start": start_ts, "end": end_ts},
-            "kraken_total_eur": float(pnl_total),
+            "kraken_total_eur": float(pnl_goal),
         }
+
 
     # -------------------- TRAINING OFFLINE (immutato salvo ranking) --------------------
     @staticmethod
@@ -3521,282 +4012,7 @@ class ActionPlanner:
 
 
 
-    # def _req_min_qty(self, cur, price: float) -> float:
-    #     limits = (cur.get("pair_limits") or {}) or {}
-    #     lot_dec  = int(limits.get("lot_decimals") or 6)
-    #     step     = 10.0 ** (-lot_dec)
-    #     ordermin = float(limits.get("ordermin") or 0.0)          # MIN in BASE
-    #     # se usi un minimo nozionale (es. self.ai.min_notional_eur), inseriscilo qui:
-    #     costmin  = float(getattr(self.ai, "min_notional_eur", 0.0) or 0.0)
-    #     req = max(ordermin, step)
-    #     if price > 0 and costmin > 0:
-    #         req = max(req, costmin / price)                      # MIN EUR → BASE
-    #     # allinea allo step (floor up “di sicurezza”)
-    #     k = max(1.0, math.ceil(req / step))
-    #     return k * step
 
-    # def _qty_from_blend(self, req_min: float, blend: float, lot_dec: int) -> float:
-    #     # piccola spinta sopra l’ordermin proporzionale al |blend|
-    #     # es: +0.0..+10% dell’ordermin
-    #     bump_pct = min(0.10, max(0.0, abs(float(blend))))  # clamp 0..10%
-    #     step = 10.0 ** (-lot_dec)
-    #     raw = req_min * (1.0 + bump_pct)
-    #     # floor allo step
-    #     n = max(1.0, math.floor(raw / step))
-    #     return n * step
-
-
-    # def plan_for_pair(self, cur: dict) -> list[dict]:
-    #     import math
-
-    #     # ---------- helpers locali (no dipendenze esterne) ----------
-    #     def _req_min_qty(cur, price: float) -> tuple[float, int, float]:
-    #         """
-    #         Quantità minima eseguibile in BASE, rispettando:
-    #         - pair_limits.ordermin (BASE)
-    #         - lot_decimals (step BASE)
-    #         - (opzionale) min notional in EUR se self.ai.min_notional_eur è impostato
-    #         Ritorna: (req_min_base, lot_dec, step)
-    #         """
-    #         limits   = (cur.get("pair_limits") or {}) or {}
-    #         lot_dec  = int(limits.get("lot_decimals") or 6)
-    #         step     = 10.0 ** (-lot_dec)
-    #         ordermin = float(limits.get("ordermin") or 0.0)  # BASE
-    #         req = max(ordermin, step)
-
-    #         costmin = float(getattr(self.ai, "min_notional_eur", 0.0) or 0.0)
-    #         if price > 0 and costmin > 0:
-    #             req = max(req, costmin / price)              # converto il min EUR in BASE
-
-    #         # allineo verso l'alto allo step (ceil → non rischio di stare sotto)
-    #         k = max(1, math.ceil(req / step))
-    #         req_min = k * step
-    #         # normalizzo precisione
-    #         req_min = float(round(req_min, lot_dec))
-    #         return req_min, lot_dec, step
-
-    #     def _qty_from_blend(req_min: float, blend: float, lot_dec: int, step: float) -> float:
-    #         """
-    #         Aggiunge una piccola spinta sopra il minimo proporzionale al |blend|.
-    #         Es.: bump 0..10% dell'ordermin.
-    #         """
-    #         bump_pct = min(0.10, max(0.0, abs(float(blend))))  # 0..10%
-    #         raw = req_min * (1.0 + bump_pct)
-    #         n = max(1, math.floor(raw / step))
-    #         qty = n * step
-    #         return float(round(qty, lot_dec))
-
-    #     # ---------- 1) segnali/blend ----------
-    #     sigs, blended, w_soft, w_eff, contribs = self._compute_signals(cur)
-
-    #     actions = []
-    #     now = ((cur.get("info") or {}).get("NOW") or {})
-    #     price = float(now.get("current_price") or 0.0)
-    #     if price <= 0:
-    #         return actions
-
-    #     base_av, eur_av = self.ai._read_available(cur)
-    #     pos_qty = self.ai._read_position_qty(cur)  # size reale posizione aperta (BASE)
-    #     intent = self.ai._classify_sell_intent(cur, blended, float(price or 0.0))
-    #     pair = cur.get("pair") or cur.get("kr_pair")
-    #     tf   = "24H"
-
-    #     # min tecnico per questa pair
-    #     req_min, lot_dec, step = _req_min_qty(cur, price)
-    #     # ---- metriche utili (target / risk) ----
-    #     day_pnl  = self.ai._pnl_realized_since(cur, self.ai._day_start_ts())
-    #     wstart   = self.ai._day_start_ts() - 6*86400
-    #     week_pnl = self.ai._pnl_realized_since(cur, wstart)
-    #     near_daily_target  = (day_pnl  >= 0.75 * self.ai.planner_cfg.daily_pnl_target_eur)
-    #     near_weekly_target = (week_pnl >= 0.75 * self.ai.planner_cfg.weekly_pnl_target_eur)
-    #     limits   = (cur.get("pair_limits") or {}) or {}
-    #     atr  = float(now.get("atr") or 0.0)
-    #     atr  = atr if atr > 0 else price * 0.01
-
-
-    #     # --- tracking EMA del blend + gestione posizione aperta ---
-    #     btrk = self.ai._update_blend_track(pair, float(blended))  # salva ema/last del blend per il pair
-    #     mgmt = self.ai._manage_open_position(cur, float(price or 0.0), float(pos_qty or 0.0))
-    #     if self.ai.debug_signals:
-    #         print(f"[signals] {pair} -> blend={round(blended,3)}")
-    #     if mgmt:
-    #         # se ha triggerato stop/trail/take, rientra subito (1 azione sola)
-    #         return [mgmt]
-
-    #     # --- weak partial exit: se forza < enter_thr e EMA-blend segnala debolezza ---
-    #     st_pos = self.ai.pos_state.get(pair)
-    #     if st_pos and price:
-    #         lot_dec2 = int((limits or {}).get("lot_decimals", 6))
-    #         step2 = Decimal(1).scaleb(-lot_dec2)
-    #         if st_pos["side"] == "long":
-    #             strength = max(0.0, float(blended))
-    #             ema_strength = max(0.0, float(btrk["ema"]))
-    #             delta = ema_strength - strength
-    #             if (0.0 < strength < self.ai.enter_thr) and (delta >= self.ai.weak_drop):
-    #                 if st_pos and float(st_pos.get("qty") or 0.0) > 0:
-    #                     qty = float(st_pos["qty"]) * float(self.ai.weak_reduce)
-    #                     # floor allo step già presente nelle righe successive
-    #                     qty = float((Decimal(str(qty)) / step2).to_integral_value(rounding=ROUND_FLOOR) * step2)
-    #                     if qty > 0:
-    #                         motivo = f"Uscita parziale LONG: debolezza blend vs EMA (Δ={delta:.2f})."
-    #                         meta2 = {"weak_exit": True, "blend_ema": float(btrk["ema"]), "delta": float(delta)}
-    #                         return [self.ai._mk_market_action(pair, "sell", qty, float(price), "NOW", motivo, meta2)]
-    #         else:  # short aperta
-    #             strength = max(0.0, -float(blended))
-    #             ema_strength = max(0.0, -float(btrk["ema"]))
-    #             delta = ema_strength - strength
-    #             if (0.0 < strength < self.ai.enter_thr) and (delta >= self.ai.weak_drop):
-    #                 qty = float(st_pos.get("qty") or 0.0) * float(self.ai.weak_reduce)
-    #                 qty = float((Decimal(str(qty)) / step2).to_integral_value(rounding=ROUND_FLOOR) * step2)
-    #                 if qty > 0:
-    #                     motivo = f"Cover parziale SHORT: debolezza blend vs EMA (Δ={delta:.2f})."
-    #                     meta2 = {"weak_exit": True, "blend_ema": float(btrk["ema"]), "delta": float(delta)}
-    #                     return [self.ai._mk_market_action(pair, "buy", qty, float(price), "NOW", motivo, meta2)]
-
-
-    #     # ---------------- (A) ENTRY LONG + BRACKET ----------------
-    #     if blended >= self.ai.enter_thr and eur_av > 0:
-    #         # qty di base: ordemin + piccolo delta dal blend
-    #         qty_des = _qty_from_blend(req_min, blended, lot_dec, step)
-
-    #         # fondi massimi traducibili in BASE
-    #         max_buyable = eur_av / price
-    #         if max_buyable + 1e-18 < req_min:
-    #             # non raggiunge il minimo → HOLD esplicito se disponibile
-    #             if hasattr(self.ai, "_mk_hold"):
-    #                 actions.append(self.ai._mk_hold(cur, motivo="Fondi EUR insufficienti a superare MIN"))
-    #             return actions
-
-    #         qty = min(qty_des, max_buyable)
-    #         # floor allo step (verso il basso) e check di sicurezza
-    #         qty = float(round(math.floor(qty / step) * step, lot_dec))
-    #         if qty + 1e-18 < req_min:
-    #             if hasattr(self.ai, "_mk_hold"):
-    #                 actions.append(self.ai._mk_hold(cur, motivo="Qty BUY < MIN dopo floor"))
-    #             return actions
-
-    #         # prezzo limit “maker-friendly”
-    #         px = self.ai._choose_limit_price(cur, side="buy") or price
-
-    #         # 1) ENTRY
-    #         actions.append(self.ai._mk_limit_action(
-    #             pair, "buy", qty, float(px), tf,
-    #             motivo=f"Entry blend={blended:.3f}",
-    #             meta={"planner": "entry", "sigs": list(map(float, sigs)), "contribs": list(map(float, contribs))}
-    #         ))
-
-    #         # 2) STOP (reduce_only=True)
-    #         sl = max(0.0, px - self.ai.planner_cfg.sl_atr_mult * atr)
-    #         actions.append(self.ai._mk_stop_action(
-    #             pair, "sell", qty, float(sl), tf,
-    #             motivo="Protective SL",
-    #             meta={"planner": "protect"},
-    #             limit_px=None,
-    #             reduce_only=True,
-    #             leverage=None
-    #         ))
-
-    #         # 3) TAKE (reduce_only=True)
-    #         tp = px + self.ai.planner_cfg.tp_pct * atr
-    #         actions.append(self.ai._mk_take_action(
-    #             pair, "sell", qty, float(tp), tf,
-    #             motivo="Take profit",
-    #             meta={"planner": "take"},
-    #             reduce_only=True,
-    #             leverage=None
-    #         ))
-
-    #     # ---------------- (B) REDUCE-ONLY (target / housekeeping) ----------------
-    #     # non emettere SELL se la posizione non raggiunge il MIN
-    #     if pos_qty > 0 and (near_daily_target or near_weekly_target or blended <= -self.ai.exit_thr/2):
-    #         if pos_qty + 1e-18 < req_min:
-    #             if hasattr(self.ai, "_mk_hold"):
-    #                 actions.append(self.ai._mk_hold(cur, motivo="Posizione < MIN: skip reduce_only"))
-    #             # niente ordini
-    #         else:
-    #             frac = float(self.ai.planner_cfg.reduce_pct_default or 0.33)
-    #             qty_des = max(req_min, pos_qty * frac)
-    #             qty = min(pos_qty, qty_des)
-    #             qty = float(round(math.floor(qty / step) * step, lot_dec))
-    #             if qty + 1e-18 >= req_min and self.ai._notional_ok(qty, price):
-    #                 px_s = self.ai._choose_limit_price(cur, side="sell") or price
-    #                 actions.append(self.ai._mk_limit_action(
-    #                     pair, "sell", qty, float(px_s), tf,
-    #                     motivo="Reduce-only (target/housekeeping)",
-    #                     meta={"planner": "reduce", "reduce_only": True}
-    #                 ))
-    #             else:
-    #                 if hasattr(self.ai, "_mk_hold"):
-    #                     actions.append(self.ai._mk_hold(cur, motivo="Qty SELL < MIN dopo floor/notional"))
-
-    #     # ---------------- (C) FUNDING reduce_only (libera capitale) ----------------
-    #     # libera capitale solo se ho almeno il MIN di posizione
-    #     # (minimo richiesto in EUR per una prossima entry)
-    #     need_eur_min = (req_min * price)
-    #     if pos_qty > 0 and eur_av < need_eur_min and blended < 0.0:
-    #         if base_av + 1e-18 >= req_min:
-    #             # frazione proporzionale alla carenza, ma non oltre il 50%
-    #             gap = (need_eur_min - eur_av)
-    #             frac = min(0.5, max(0.25, gap / max(need_eur_min, 1e-9)))
-    #             qty_des = max(req_min, pos_qty * frac)
-    #             qty = min(pos_qty, qty_des)
-    #             qty = float(round(math.floor(qty / step) * step, lot_dec))
-    #             if qty + 1e-18 >= req_min and self.ai._notional_ok(qty, price):
-    #                 px_f = self.ai._choose_limit_price(cur, side="sell") or price
-    #                 actions.append(self.ai._mk_limit_action(
-    #                     pair, "sell", qty, float(px_f), tf,
-    #                     motivo="Funding reduce_only",
-    #                     meta={"planner":"funding", "reduce_only": True}
-    #                 ))
-    #             else:
-    #                 if hasattr(self.ai, "_mk_hold"):
-    #                     actions.append(self.ai._mk_hold(cur, motivo="Qty funding < MIN dopo floor/notional"))
-
-    #     # ---------------- (D) STOP refresh se rischio alto ----------------
-    #     # crea stop ONLY se ho almeno il MIN in posizione
-    #     if pos_qty > 0 and blended < -self.ai.exit_thr:
-    #         if pos_qty + 1e-18 >= req_min:
-    #             sl2 = price - self.ai.planner_cfg.sl_atr_mult * atr
-    #             qty = float(round(math.floor(pos_qty / step) * step, lot_dec))
-    #             # clamp a base_av ma mai sotto req_min
-    #             if qty + 1e-18 >= req_min and self.ai._notional_ok(qty, price):
-    #                 actions.append(self.ai._mk_stop_action(
-    #                     pair, "sell", qty, float(sl2), tf,
-    #                     motivo="Stop refresh", meta={"planner":"stop_refresh"},
-    #                     limit_px=None, reduce_only=True, leverage=None
-    #                 ))
-    #         else:
-    #             if hasattr(self.ai, "_mk_hold"):
-    #                 actions.append(self.ai._mk_hold(cur, motivo="Posizione < MIN: skip stop refresh"))
-
-
-    #     if intent == "SHORT_ENTRY":
-    #         lev_max, eur_collat = self.ai._read_short_capacity(cur)
-    #         if price and price > 0 and eur_collat > 0:
-    #             # leva effettiva conservativa: usa init MR se lo usi, o limita con lev_max
-    #             lev_eff = min(float(lev_max), 1.0 / max(getattr(self.ai, "margin_init_mr", 0.2), 1e-9))
-    #             lev_eff *= float(getattr(self.ai, "margin_safety", 0.9))
-
-    #             cap_qty = (eur_collat * lev_eff) / price
-    #             qty_des = max(req_min, cap_qty * float(getattr(self.ai, "size_mult", 1.0)))
-    #             qty = min(cap_qty, qty_des)
-    #             qty = float(round(math.floor(qty / step) * step, lot_dec))
-
-    #             if qty >= req_min and self.ai._notional_ok(qty, price):
-    #                 actions.append(self.ai._mk_market_action(
-    #                     pair=pair,
-    #                     side="sell",
-    #                     qty=qty,
-    #                     price_now=price,   # o now price
-    #                     tf="24H",
-    #                     motivo="short_entry",
-    #                     meta={"reason": "short_entry"}  # opzionale; qui puoi mettere flag informativi
-    #                 ))
-
-
-    #     return actions
-
-    #     # ---------- helpers locali (no dipendenze esterne) ----------
     def _req_min_qty(self, cur, price: float) -> tuple[float, int, float]:
         """
         Quantità minima eseguibile in BASE, rispettando:
@@ -4007,6 +4223,21 @@ class ActionPlanner:
         try:
             sigs, blended, w_soft, w_eff, contribs = self.ai._signals_for_currency(cur)
             req_min, lot_dec, step = self._req_min_qty(cur, price)
+            # ---- GOAL URGENCY → ritocca soglie di ingresso/uscita
+            urgency = float(cur.get("_goal_urgency") or 0.0)  # 0..1
+            # più urgenza ⇒ più facile entrare (fino a -35% di soglia)
+            enter_thr_eff = max(0.05, self.ai.enter_thr * (1.0 - self.ai.goal_cfg.urgency_max_boost * urgency))
+            exit_thr_eff  = max(0.05, self.ai.exit_thr  * (1.0 - 0.50 * urgency))  # leggermente più propenso a ridurre
+
+            # ---- EXPOSURE CAP → limita nuove size se già esposto (pos + open orders)
+            exp = (cur.get("_exposure") or {})
+            exposure_eur = float(exp.get("exposure_eur_with_orders") or 0.0)
+            # budget massimo per singolo trade dalla policy esistente (dipende da blend)
+            cap_for_score = self.ai._score_to_cap(abs(float(blended)))
+            # se già esposto oltre il cap, preferisci HOLD/reduce
+            if exposure_eur >= 1.15 * cap_for_score:
+                # annota e ritorna un HOLD esplicito, così il runner lo logga ma non ordina
+                return [ self.ai._mk_hold(cur, motivo="Exposure over cap") ]
             btrk = self.ai._update_blend_track(pair, float(blended))  # salva ema/last del blend per il pair
             leverage = 1
         except Exception as e:
@@ -4034,14 +4265,25 @@ class ActionPlanner:
                 if totVov > 0:
                     qty = totVov
                     reduce_only = True
+                    leverage = self.ai.leverage if leverage_buy == True else 2
+                    motivo="Take profit"
+                    reason = "buy market lev under"
                 if blended >= self.market_enter_lev:
                     leverage = self.ai.leverage if leverage_buy == True else 1
                     motivo="Compro subito che mo scoppia!! e glie do forte!!"
                     reason = "buy market lev"
             else:
-                limitBool = True
-                motivo="Entrata con prudenza"
-                reason = "buy limite"
+                if totVov > 0:
+                    qty = totVov
+                    reduce_only = True
+                    leverage = self.ai.leverage if leverage_buy == True else 2
+                    motivo="Take profit"
+                    reason = "buy market lev under"
+                    quando= "market"
+                else:
+                    limitBool = True
+                    motivo="Entrata con prudenza"
+                    reason = "buy limite"
         # SELL
         if abs(blended) > abs(self.ai.exit_thr) and blended < 0:
             type = "sell"
@@ -4134,6 +4376,16 @@ class ActionPlanner:
         else:
             stop_px, take_px = self._levels_from_blend(type, price, atr_value, blended)
 
+                    # ... dopo aver deciso side e qty_base "grezza" ...
+        # CAP con esposizione: non superare il cap_for_score in EUR
+        if price > 0:
+            eur_desired = float(qty) * price
+            room = max(0.0, cap_for_score - exposure_eur)
+            if room <= self.ai.min_order_eur:
+                return [ self.ai._mk_hold(cur, motivo="No room under exposure cap") ]
+            if eur_desired > room:
+                qty = room / price
+
         if type != "hold":
             self.ai._remember_entry(pair, ("long" if type == 'buy' else 'short'), qty, float((limite if limite else price)), stop_px, take_px)
 
@@ -4142,7 +4394,18 @@ class ActionPlanner:
         take_px = floor_dec(take_px, (pair_decimals)) if pair_decimals > 0 else int(take_px)
         price = floor_dec(price, (pair_decimals)) if pair_decimals > 0 else int(price)
         if limite:
-            limite = floor_dec(limite, (pair_decimals))
+            limite = floor_dec(limite, (pair_decimals)) if pair_decimals > 0 else int(limite)
+        conf = float(abs(blended))
+        meta = {
+            "reason": motivo,
+            "signals": list(map(float, sigs)),
+            "weights": w_soft.tolist(),
+            "weights_eff": w_eff.tolist(),
+            "contribs": contribs.tolist(),
+            "w_names": [s.name for s in self.ai.strategies],
+            "blend": float(blended),
+            "conf": conf,
+        }
         try:
             action = {
                 "pair": pair,
@@ -4159,9 +4422,7 @@ class ActionPlanner:
                 "limite": limite,
                 "leverage": leverage,
                 "motivo": reason,
-                "meta": {
-                    "reason": motivo
-                },
+                "meta": meta,
                 "reduce_only" : reduce_only,
                 "blend": blended,
                 "cancel_order_id": ""

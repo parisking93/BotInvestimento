@@ -250,7 +250,7 @@ ALL_EXEC_REPORTS = []
 
 # 1) Sorgente STREAMING da InfoMarket2
 # istanzia InfoMarket2 in modalità streaming
-im2 = InfoMarket2(per_run=10, total=250, quote="EUR", verbose=True, only_positions=True)
+im2 = InfoMarket2(per_run=15, total=390, quote="EUR", verbose=True, only_positions=False)
 source_aiter = im2.stream_async()   # <--- async iterator di batch da 15 oggetti
 
 from dataclasses import asdict
@@ -311,11 +311,15 @@ async def deliver_fn(item):
     bodies = runner.build_bodies(actions, validate=False, auto_brackets=False)
     test = runner.execute_bodies(bodies, timeout=0.8)
     ai.learn_price_size_from_results(bodies, test)  # <-- NOVITÀ
-    report = ai.update_weights_from_kraken(actions_ai=actions, lookback_hours=72)
+
+    # === NEW: aggiorna goal/pesi in modo idempotente leggendo SOLO i SELL nuovi di oggi ===
+    pnl_delta = ai.update_goal_from_trades_incremental(batch_objs,actions)
+    print(f"[deliver_fn#{batch_id}] pnl_delta_goal = {pnl_delta:.2f} EUR (incrementale)")
+    # report = ai.update_weights_from_kraken(actions_ai=actions, lookback_hours=72)
 
     print('report')
 
-    print(report)
+    # print(report)
     print('report end')
 
     print('bodies')

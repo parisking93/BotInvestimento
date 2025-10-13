@@ -23,10 +23,102 @@ from Class.KrakenOrderRunner import KrakenOrderRunner
 from Pipeline import TradePipeline, PipelineConfig, StageConfig
 
 from Class.OpenOrder import JsonObjectIO, Currency
+RES_STATE_PATH = os.path.join(os.getcwd(), "ai_features_state.json")
+_RES_IDX = None  # cache
 
-
+_RES_RANGES = ["6H", "24H", "48H", "7D", "1M", "6M", "1Y"]
+_RES_FEATNAMES = sum([[f"dist_top_{r}", f"dist_bot_{r}", f"bandw_{r}", f"pos_in_band_{r}"] for r in _RES_RANGES], [])
 def _asdict(x):
     return asdict(x) if is_dataclass(x) else x
+
+
+
+import numpy as np  # se non già importato
+
+def _index_res_state(state: dict) -> dict:
+    """state['per_currency'][pair] -> list di {ts, max_resistance, min_support}  ==>  dict[pair][ts]=(top,bot)"""
+    out = {}
+    for pair, items in (state.get("per_currency") or {}).items():
+        d = {}
+        for it in items or []:
+            ts = it.get("ts")
+            if not ts:
+                continue
+            d[ts] = (it.get("max_resistance"), it.get("min_support"))
+        out[pair] = d
+    return out
+
+def _ensure_res_index(path: str = RES_STATE_PATH) -> dict:
+    global _RES_IDX
+    if _RES_IDX is not None:
+        return _RES_IDX
+    try:
+        state = safe_read_json(path)
+    except Exception:
+        state = {}
+    _RES_IDX = _index_res_state(state)
+    return _RES_IDX
+
+def _pick_pair_from_row_like(row: dict) -> str:
+    p = row.get("pair")
+    if p:
+        return p
+    b = row.get("base"); q = row.get("quote")
+    if b and q:
+        return f"{b}/{q}"
+    return str(p or "")
+
+def _pick_price_now_from_row_like(row: dict) -> float:
+    # prova varie colonne tipiche del tuo dataset offline
+    for k in ("price_now","current_price","last","close","open","mid","px"):
+        v = row.get(k)
+        if v is None or v == "":
+            continue
+        try:
+            return float(v)
+        except Exception:
+            continue
+    return 0.0
+
+def add_resistance_features_to_df(df: "pd.DataFrame", res_state_path: str = RES_STATE_PATH) -> "pd.DataFrame":
+    """Aggiunge (se mancanti) le colonne di resistenza al DataFrame e le calcola riga-per-riga usando ai_features_state.json."""
+    idx = _ensure_res_index(res_state_path)
+
+    # crea colonne se mancano
+    for r in _RES_RANGES:
+        for c in ("dist_top","dist_bot","bandw","pos_in_band"):
+            col = f"{c}_{r}"
+            if col not in df.columns:
+                df[col] = 0.0
+
+    # calcolo per riga
+    def _calc_row(row):
+        pair = _pick_pair_from_row_like(row)
+        lvls = idx.get(pair, {})
+        px = _pick_price_now_from_row_like(row)
+        out = {}
+        for R in _RES_RANGES:
+            top, bot = (None, None)
+            if R in lvls:
+                t, b = lvls[R]
+                top = float(t) if isinstance(t, (int, float)) else None
+                bot = float(b) if isinstance(b, (int, float)) else None
+            band = (top - bot) if (top is not None and bot is not None) else None
+
+            dist_top = (px - top) / px if (top is not None and px) else np.nan
+            dist_bot = (px - bot) / px if (bot is not None and px) else np.nan
+            bandw    = (band / px)    if (band is not None and px) else np.nan
+            pos      = ((px - bot) / (band + 1e-12)) if (band is not None and bot is not None) else np.nan
+
+            out[f"dist_top_{R}"] = 0.0 if (dist_top is None or np.isnan(dist_top)) else float(dist_top)
+            out[f"dist_bot_{R}"] = 0.0 if (dist_bot is None or np.isnan(dist_bot)) else float(dist_bot)
+            out[f"bandw_{R}"]    = 0.0 if (bandw is None or np.isnan(bandw)) else float(bandw)
+            out[f"pos_in_band_{R}"] = 0.0 if (pos is None or np.isnan(pos)) else float(pos)
+        return pd.Series(out)
+
+    # applica in blocco (veloce)
+    df[_RES_FEATNAMES] = df.apply(_calc_row, axis=1)
+    return df
 
 def _nonnull(x, y):
     """Preferisci y se non None/empty, altrimenti x."""
@@ -454,6 +546,25 @@ if __name__ == "__main__":
     print(s.nn)
     s.fit(pd.read_csv("aiConfig/dataset_for_neural.csv"))
 
+
+    # === AUGMENT DATASET LGBM CON FEATURE DI RESISTENZE ===
+    ds_path = "aiConfig/dataset_lgbm.csv"
+    if os.path.exists(ds_path):
+        df_ds = pd.read_csv(ds_path)
+        df_ds = add_resistance_features_to_df(df_ds, res_state_path=RES_STATE_PATH)
+        # opzionale: assicurati che tutte le colonne base esistano (fallback)
+        base_feat = ["ch24","ch48","dev_1h","dev_4h","vol_dev","atr1h","b1","b4",
+                    "spread_ratio","slip_avg","or_ok","or_pos","or_w"]
+        for col in base_feat:
+            if col not in df_ds.columns:
+                df_ds[col] = 0.0
+        # salva aggiornato: il trainer ora vedrà anche le nuove colonne
+        df_ds.to_csv(ds_path, index=False)
+    else:
+        print(f"[WARN] Dataset LGBM non trovato: {ds_path} — salto l'augment.")
+
+
+    train_lgbm_offline("aiConfig/dataset_lgbm.csv", "aiConfig/lgbm_model.pkl")
     from pandas.errors import EmptyDataError
     import os, pandas as pd
 

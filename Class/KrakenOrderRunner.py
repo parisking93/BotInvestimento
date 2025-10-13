@@ -2,7 +2,6 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from dataclasses import asdict
 import time
 import os
-import math
 
 try:
     import krakenex  # opzionale a runtime
@@ -175,13 +174,12 @@ class KrakenOrderRunner:
             # close condition: vince sempre lo stop_loss se presenti entrambi
             close_ordertype = None
             close_price = None
-            close_price2 = None
             if stop_loss is not None:
                 close_ordertype = "stop-loss"
-                close_price = float(stop_loss)
+                close_price = stop_loss
             elif take_profit is not None:
                 close_ordertype = "take-profit"
-                close_price = float(take_profit)
+                close_price = take_profit
 
             body = {"pair": kr_pair, "type": side}
             if lev:
@@ -201,24 +199,24 @@ class KrakenOrderRunner:
                 px = limite if (limite is not None) else prezzo
                 if px is None:
                     continue
-                body["price"] = float(px)
+                body["price"] = px
             elif q in ("stop", "al_break"):
-                # Ordine primario di tipo stop (non richiesto per il tuo flusso ma manteniamo)
                 trig = break_price if (break_price is not None) else prezzo
                 if trig is None:
                     continue
                 if limite is not None:
                     body["ordertype"] = "stop-loss-limit"
-                    body["price"] = float(trig)   # trigger
-                    body["price2"] = float(limite)
+                    body["price"] = trig      # trigger
+                    body["price2"] = limite   # limite
                 else:
                     body["ordertype"] = "stop-loss"
-                    body["price"] = float(trig)
+                    body["price"] = trig
             else:
                 continue
 
-            if (volume is not None) and (float(volume) > 0):
-                body["volume"] = float(volume)
+            # volume: NON modifichiamo il valore
+            if volume is not None:
+                body["volume"] = volume
 
             # reduce-only
             reduce_only = a.get("reduce_only")
@@ -230,8 +228,8 @@ class KrakenOrderRunner:
             # Conditional close: UNA SOLA, attaccata all'ordine principale
             if close_ordertype and close_price is not None:
                 body["close[ordertype]"] = close_ordertype
-                body["close[price]"] = float(close_price)
-                # Se mai in futuro vorrai stop-limit o take-profit-limit, userai anche close[price2]
+                body["close[price]"] = close_price
+                # se mai userai stop-limit/take-profit-limit, potrai aggiungere anche close[price2]
 
             body["_meta"] = {"from": "Action", "timeframe": tf, "motivo": motivo}
             bodies.append(body)
@@ -263,10 +261,6 @@ class KrakenOrderRunner:
         if not d:
             return None
         return d.get("base"), d.get("quote")
-
-    def _pair_price_decimals(self, pair: str) -> int:
-        d = self._pairs_cache.get(pair) or {}
-        return int(d.get("pair_decimals", d.get("price_decimals", 5)))
 
     def _pair_min_volume(self, pair: str) -> float:
         d = self._pairs_cache.get(pair) or {}
@@ -315,25 +309,6 @@ class KrakenOrderRunner:
         except Exception:
             return None
 
-    def _apply_price_rounding(self, payload: dict) -> None:
-        """Arrotonda price/price2 ai decimali consentiti dal pair."""
-        pair = payload.get("pair")
-        if not pair:
-            return
-        dec = self._pair_price_decimals(pair)
-        def _round(v):
-            try:
-                if v is None:
-                    return v
-                q = 10 ** dec
-                return math.floor(float(v) * q + 0.5) / q
-            except Exception:
-                return v
-        if "price" in payload:
-            payload["price"] = _round(payload.get("price"))
-        if "price2" in payload:
-            payload["price2"] = _round(payload.get("price2"))
-
     # ----------------- esecuzione -----------------
     def execute_bodies(self, bodies: list[dict], *, timeout: float = 0.5) -> list[dict]:
         """
@@ -364,14 +339,9 @@ class KrakenOrderRunner:
                         time.sleep(timeout)
                     continue
 
-                # Pulisci meta
+                # Pulisci meta e invia esattamente i valori passati (senza cast/rounding)
                 payload = {kk: vv for kk, vv in body.items() if not kk.startswith("_")}
 
-                # Arrotondamento prezzi (se presente price/price2/close[...] non li tocchiamo: Kraken accetta i campi "close[...]")
-                if payload.get("pair"):
-                    self._apply_price_rounding(payload)
-
-                # Invia
                 try:
                     resp = k.query_private("AddOrder", payload)
                 except Exception as e:
