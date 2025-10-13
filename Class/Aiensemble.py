@@ -1210,6 +1210,56 @@ class MomentumStrategy(Strategy):
     clip_abs: float = 1.0
 
     @staticmethod
+    def _pos_base(row: dict) -> float:
+        """
+        Ritorna la quantità BASE attualmente detenuta.
+        1) spot: portfolio.row.qty
+        2) fallback: portfolio.position.base / portfolio.positions[0].base
+        """
+        try:
+            port = row.get("portfolio") or {}
+            # 1) SPOT (come nel tuo payload)
+            spot_qty = (port.get("row") or {}).get("qty")
+            if spot_qty is not None:
+                return float(spot_qty) or 0.0
+
+            # 2) Fallbacks generici
+            pos = port.get("position") or {}
+            if isinstance(pos, dict):
+                b = pos.get("base")
+                if b is not None:
+                    return float(b) or 0.0
+
+            poss = port.get("positions") or []
+            if poss and isinstance(poss[0], dict):
+                b = (poss[0].get("base") if poss[0] else None)
+                if b is not None:
+                    return float(b) or 0.0
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _pending_delta_base_from_open_orders(row: dict) -> float:
+        """
+        Somma BUY(+) e SELL(-) degli open_orders come delta BASE ancora 'in arrivo'.
+        Usa vol_rem (size residua) se presente.
+        """
+        oo = row.get("open_orders") or row.get("opens_orders") or []
+        delta = 0.0
+        for o in oo:
+            try:
+                side = (o.get("type") or o.get("side") or "").lower()
+                vol  = float(o.get("vol_rem") or o.get("volume") or o.get("vol") or o.get("qty") or 0.0)
+                if side == "buy":
+                    delta += vol
+                elif side == "sell":
+                    delta -= vol
+            except Exception:
+                continue
+        return float(delta)
+
+    @staticmethod
     def _ch(info: dict, tf: str) -> float:
         """Ritorna change_pct per il timeframe tf se presente, altrimenti 0.0."""
         blk = info.get(tf, {})
@@ -1220,29 +1270,7 @@ class MomentumStrategy(Strategy):
             return 0.0
 
 
-    # ----- helpers position/orders/goal (robusti su chiavi) -----
-    @staticmethod
-    def _pos_base(row: dict) -> float:
-        try:
-            pos = ((row.get("portfolio") or {}).get("position") or {})
-            return float(pos.get("base") or 0.0)
-        except Exception:
-            return 0.0
 
-    @staticmethod
-    def _pending_delta_base_from_open_orders(row: dict) -> float:
-        """Somma BUY(+) e SELL(-) degli open_orders per avere il delta base 'in arrivo'."""
-        oo = row.get("open_orders") or row.get("opens_orders") or []
-        delta = 0.0
-        for o in oo:
-            try:
-                side = (o.get("type") or o.get("side") or "").lower()
-                vol  = float(o.get("volume") or o.get("vol") or o.get("qty") or o.get("vol_rem") or 0.0)
-                if side == "buy":  delta += vol
-                elif side == "sell": delta -= vol
-            except Exception:
-                continue
-        return float(delta)
 
     @staticmethod
     def _goal_ctx(row: dict) -> tuple[float, bool, bool]:
@@ -1273,74 +1301,94 @@ class MomentumStrategy(Strategy):
         return float(np.clip(urg, 0.0, 1.0)), bool(near_d), bool(near_w)
 
 
-
     def signal(self, row: Dict[str, Any]) -> float:
         info = row.get("info", {}) or {}
 
-        # ===== 1) Momentum pesato su più timeframe =====
+        # ===== 1) Momentum multi-TF (come tuo) =====
         changes, weights = [], []
         for tf, w in self.timeframes_weights:
-            c = self._ch(info, tf)
-            if c is None:
-                c = 0.0
-            changes.append(c)
-            weights.append(w)
+            c = self._ch(info, tf) or 0.0
+            changes.append(c); weights.append(w)
+        m = float(np.dot(changes, weights) / sum(weights)) if sum(weights) > 0 else 0.0
 
-        if sum(weights) > 0:
-            m = float(np.dot(changes, weights) / sum(weights))  # momentum medio
-        else:
-            m = 0.0
-
-        # ===== 2) Proxy di volatilità e normalizzazione "Sharpe-like" =====
-        # uso la media degli assoluti delle variazioni disponibili come vol
+        # ===== 2) Normalizzazione "Sharpe-like" =====
         nonzero = [abs(c) for c in changes if c is not None]
-        vol = float(np.mean(nonzero)) if len(nonzero) else 0.0
+        vol = float(np.mean(nonzero)) if nonzero else 0.0
         denom = max(self.vol_floor, vol * self.beta_vol)
         score = m / denom
 
-        # ===== 3) Bonus/malus di accordo tra timeframe =====
-        if len(nonzero):
+        # ===== 3) Bonus/malus di accordo =====
+        if nonzero:
             sgn_m = np.sign(m) if m != 0 else 0.0
             if sgn_m != 0:
-                agree = np.mean([1.0 if np.sign(c) == sgn_m and c != 0 else 0.0 for c in changes])
-                # scala in ~[0.85, 1.15] con agree_boost=0.15
+                agree = np.mean([1.0 if (c != 0 and np.sign(c) == sgn_m) else 0.0 for c in changes])
                 score *= (1.0 + self.agree_boost * (agree - 0.5) * 2.0)
 
-        # ===== 4) Freno di regime: long più prudenti se 30D è negativo =====
+        # ===== 4) Freno long se 30D < 0 =====
         ch30 = self._ch(info, "30D")
         if score > 0 and ch30 < 0:
             score *= self.downtrend_dampen
 
-        # ===== 5) Squash morbido =====
+        # ===== 5) Squash =====
         score = float(np.tanh(score))
 
-        # ===== 6) Position / OpenOrders / Goal AWARE (solo aggiunte, nessuna rimozione) =====
-        pos_base = self._pos_base(row)                                     # >0 long, <0 short
-        pend_base = self._pending_delta_base_from_open_orders(row)         # delta base in arrivo da ordini aperti
+        # ===== 6) Position / OpenOrders / Goal AWARE =====
+        pos_base = self._pos_base(row)                              # >0 long, <0 short
+        pend_base = self._pending_delta_base_from_open_orders(row)  # delta base da ordini aperti
+
         urg, near_d, near_w = self._goal_ctx(row)
 
-        # (a) Spinta a CHIUDERE/RIDURRE quando lo score è in disaccordo con la posizione attuale
-        #     Esempio: se sono long (pos_base>0) ma il momentum è <=0 → spingo il punteggio verso negativo.
-        #     Più urgenza ⇒ più voglia di rientrare a target (k_pos sale).
+        # --- PnL latente (corretto) ---
+        now_blk = (info.get("NOW") or {})
+        # per stima conservativa: usa bid se long, ask se short; fallback a last/current_price
+        px_bid = now_blk.get("bid"); px_ask = now_blk.get("ask")
+        px_last = now_blk.get("last") or now_blk.get("current_price")
+        try:
+            px_bid = float(px_bid) if px_bid is not None else None
+            px_ask = float(px_ask) if px_ask is not None else None
+            px_last = float(px_last) if px_last is not None else 0.0
+        except Exception:
+            px_bid, px_ask, px_last = None, None, 0.0
+
+        if pos_base > 0:
+            px_now = px_bid if px_bid else px_last
+        elif pos_base < 0:
+            px_now = px_ask if px_ask else px_last
+        else:
+            px_now = px_last
+
+        port = (row.get("portfolio") or {})
+        avg = (port.get("row") or {}).get("avg_buy_EUR")  # come nel payload
+        try:
+            avg = float(avg) if avg is not None else 0.0
+        except Exception:
+            avg = 0.0
+
+        upnl_eur = float(pos_base) * (px_now - avg) if (pos_base != 0.0 and px_now > 0.0 and avg > 0.0) else 0.0
+        # ------------------------------------------------
+
+        # Take-profit se abbiamo urgenza + PnL latente positivo
+        if urg > 0.25 and upnl_eur > 0.0 and pos_base != 0.0:
+            k_take = min(0.30, 0.10 + 0.25 * float(urg))
+            score += float(-np.sign(pos_base) * k_take)
+
+        # (a) Spinta a ridurre se score disaccorda con posizione
         k_pos = 0.22 + 0.28 * urg
         score += float(-k_pos * np.tanh(pos_base)) * (1.0 if score <= 0 else 0.5)
-        # Nota: se score è già negativo e sono long, l’effetto è pieno; se è positivo, è solo una lieve frenata.
 
-        # (b) Spinta a NON AUMENTARE se ho già ordini pendenti nella stessa direzione
-        #     Se lo score spinge buy e ho già BUY pendenti → attenua.
+        # (b) Non aumentare se ho già ordini pendenti stessa direzione
         same_dir = np.sign(score) == np.sign(pend_base) and pend_base != 0.0
         if same_dir:
             k_pend = 0.20 + 0.20 * urg
             score *= float(1.0 - np.clip(k_pend * np.tanh(abs(pend_base)), 0.0, 0.5))
 
-        # (c) Vicino ai target (daily/weekly) → favorisci TAKE-PROFIT, smorza aperture nella direzione del trend
+        # (c) Vicino ai target → favorisci TP
         if near_d or near_w:
             k_goal = 0.18 if (near_d and near_w) else 0.12
-            score *= float(1.0 - k_goal)                 # meno voglia di aumentare
-            # se sono in posizione, aggiungi una leggera spinta opposta per promuovere chiusure parziali
+            score *= float(1.0 - k_goal)
             score += float(-np.sign(pos_base) * 0.10)
 
-        # ===== 7) Clip finale =====
+        # ===== 7) Clip =====
         return float(np.clip(score, -self.clip_abs, self.clip_abs))
 
 
@@ -1740,6 +1788,74 @@ class NeuralStrategy(Strategy):
             print('error save scaler')
             pass
 
+    @staticmethod
+    def _read_now_price(row: dict) -> float:
+        info = (row.get("info") or {})
+        now  = (info.get("NOW") or {})
+        return float(
+            now.get("current_price")
+            or now.get("last")
+            or now.get("close")
+            or now.get("open")
+            or 0.0
+        )
+
+
+    @staticmethod
+    def _read_pos_base(row: dict) -> float:
+        """Spot: prendi qty da portfolio.row; fallback a portfolio.position.base se esiste."""
+        p = (row.get("portfolio") or {})
+        # fallback (futuro/margin): posizione esplicita
+        pos = (p.get("position") or {}) or {}
+        if "base" in pos:
+            try:
+                return float(pos.get("base") or 0.0)
+            except Exception:
+                pass
+
+        r = (p.get("row") or {}) or {}
+        try:
+            # coerenza: qty è in base; se l'asset combacia col base della row, usalo
+            b = row.get("base")
+            if (r.get("asset") == b) or (r.get("code") == b):
+                return float(r.get("qty") or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _read_pending_delta_base(row: dict) -> float:
+        """Somma dei volumi pending in base: BUY = +, SELL = - (usa vol_rem/volume/qty)."""
+        tot = 0.0
+        for o in (row.get("open_orders") or []):
+            try:
+                side = (o.get("type") or o.get("side") or "").lower()
+                vol  = float(o.get("vol_rem") or o.get("volume") or o.get("qty") or 0.0)
+                if side == "buy":
+                    tot += vol
+                elif side == "sell":
+                    tot -= vol
+            except Exception:
+                continue
+        return float(tot)
+
+    @staticmethod
+    def _unrealized_pnl_eur(row: dict, px_now: float) -> float:
+        """
+        PnL latente in EUR = (px_now - avg_buy_EUR) * qty
+        (coerente con i campi che hai: px_EUR, avg_buy_EUR, qty)
+        """
+        p = (row.get("portfolio") or {})
+        r = (p.get("row") or {}) or {}
+        try:
+            qty   = float(r.get("qty") or 0.0)
+            avg   = float(r.get("avg_buy_EUR") or 0.0)
+            # opzionale: se non passi px_now, usa px_EUR dal portfolio
+            px    = float(px_now or r.get("px_EUR") or 0.0)
+            return float((px - avg) * qty)
+        except Exception:
+            return 0.0
+
 
     # ---------- training ----------
     def fit(self, df: pd.DataFrame) -> "Strategy":
@@ -1873,20 +1989,65 @@ class NeuralStrategy(Strategy):
         return X, (mu, sd)
 
     def _apply_guards_and_bias(self, score: float, row: Dict[str, Any]) -> float:
-        """Smorza su ATR piatto/OR non valido e aggiusta per bias 1h/4h."""
+        """Smorza su ATR piatto/OR non valido, aggiusta per bias 1h/4h e rende il segnale 'context aware'."""
         info = (row.get("info") or {}); now = (info.get("NOW") or {})
         b1h = (info.get("1H") or info.get("60M") or {}) or {}
         atr1h = float(b1h.get("atr") or 0.0)
+
+        # --- guard rails di base
         if atr1h <= float(self.params.get("flat_atr_floor", 1e-8)):
             score *= 0.2
         if not bool(now.get("or_ok")):
             score *= 0.7
+
+        # bias multi-TF
         b1 = now.get("bias_1h"); b4 = now.get("bias_4h")
         boost = float(self.params.get("bias_boost", 0.08))
         pen   = float(self.params.get("bias_penalty", 0.06))
         for b in (b1, b4):
             if b == "UP":   score += boost
             elif b == "DOWN": score -= pen
+
+        # --------- CONTEXT AWARE: posizione, ordini pendenti, target ----------
+        px_now    = self._read_now_price(row)
+        pos_base  = self._read_pos_base(row)              # >0 long, <0 short
+        pend_base = self._read_pending_delta_base(row)    # BUY(+) / SELL(-)
+        # goal flags/urgenza: se li hai già nel row usa quelli; altrimenti 0/False
+        near_d = bool(row.get("near_daily_target")); near_w = bool(row.get("near_weekly_target"))
+        urg = float(row.get("_goal_urgency") or 0.0)
+        urg = float(np.clip(urg, 0.0, 1.0))
+
+        upnl_eur = self._unrealized_pnl_eur(row, px_now)
+
+        # (1) se sto già andando nella stessa direzione della posizione → attenua (evita over-exposure)
+        same_dir_pos = (pos_base != 0.0) and (np.sign(score) == np.sign(pos_base))
+        if same_dir_pos:
+            k_pos = 0.22 + 0.28 * float(urg)     # più urgenza => più freno ad aumentare
+            score *= float(1.0 - np.clip(k_pos * np.tanh(abs(pos_base)), 0.0, 0.50))
+
+        # (2) se ho ordini pendenti nella stessa direzione → attenua (evita ‘doppioni in coda’)
+        same_dir_pend = (pend_base != 0.0) and (np.sign(score) == np.sign(pend_base))
+        if same_dir_pend:
+            k_pend = 0.20 + 0.20 * float(urg)
+            score *= float(1.0 - np.clip(k_pend * np.tanh(abs(pend_base)), 0.0, 0.50))
+
+        # (3) vicino ai target → smorza aperture e spingi leggermente alla chiusura
+        if near_d or near_w:
+            k_goal = 0.18 if (near_d and near_w) else 0.12
+            score *= float(1.0 - k_goal)
+            if pos_base != 0.0:
+                score += float(-np.sign(pos_base) * 0.10)  # bias al take-profit parziale
+
+        # (4) se siamo indietro (urgenza alta) ma ho PnL latente positivo → bias a realizzare
+        if urg > 0.25 and upnl_eur > 0.0 and pos_base != 0.0:
+            k_take = min(0.30, 0.10 + 0.25 * float(urg))
+            score += float(-np.sign(pos_base) * k_take)
+
+        # (5) URGENZA molto alta + PnL latente NEGATIVO → piccolo bias a ridurre il rischio
+        if urg > 0.60 and upnl_eur < 0.0 and pos_base != 0.0:
+            k_cut = min(0.20, 0.05 + 0.20 * (urg - 0.60))   # max 0.20
+            score += float(-np.sign(pos_base) * k_cut)
+
         return float(np.clip(score, -1.0, 1.0))
 
     def _heuristic_score_mtf(self, row: Dict[str, Any]) -> float:
@@ -2101,7 +2262,7 @@ class SqueezeBreakoutStrategy(Strategy):
 class WeightConfig:
     lr: float = 0.48
     decay: float = 0.97
-    temp: float = 1.8
+    temp: float = 1.6
     jitter: float = 1e-3
     # NUOVI (opzionali, hanno default):
     reward_scale: float = 50.0   # scala del PnL prima della tanh

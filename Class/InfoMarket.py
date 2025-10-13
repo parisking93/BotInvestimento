@@ -1239,7 +1239,8 @@ class InfoMarket2:
             max_pairs=len(human_pairs), depth_top_n=25,
             sleep_per_call=0.0, sleep_per_pair=0.0
         )
-
+        # Calcolo MTF robusto per il batch e iniezione nei blocchi
+        mtf_map = self._mtf_for_block(kr_list)
         # 2) costruiamo arricchimento portfolio da _portfolio_snapshot (se presente)
         snap = self._portfolio_snapshot or {}
         balances = dict(snap.get("balances") or {})
@@ -1272,6 +1273,18 @@ class InfoMarket2:
             code = r.get("code")
             if code:
                 portfolio_by_code[code] = r
+
+        for it in items_market:
+        # Inietta MTF (ema50/200 1h/4h + bias) se mancanti
+            kr = it.get("kr_pair")
+            mtf = mtf_map.get(kr, {}) if kr else {}
+            for rng in ("NOW","1H", "4H", "24H", "48H"):
+                blk = it.get("info", {}).get(rng, {})
+                if blk is None: continue
+                # se i campi sono None, riempi
+                for key in ("ema50_1h","ema200_1h","ema50_4h","ema200_4h","bias_1h","bias_4h"):
+                    if blk.get(key) is None and (key in mtf):
+                        blk[key] = mtf[key]
 
 
         def to_kr_pair(s: str | None) -> str | None:

@@ -63,8 +63,8 @@ class KrakenPortfolio:
         secret=None,
         rate_limit_sec=None,
         balances_ttl=30,
-        trades_ttl=180,
-        ledgers_ttl=120,
+        trades_ttl=150,
+        ledgers_ttl=100,
     ):
         self.k = krakenex.API(
             key=key or os.environ.get("KRAKEN_KEY"),
@@ -393,7 +393,7 @@ class KrakenPortfolio:
         Ritorna (rows, total_eur, trades, ledgers).
         Di default NON scarica trades/ledgers (pesanti): abilita con include_diagnostics=True.
         """
-        bals = self.balances(self._balances_ttl)
+        self.bals = self.balances(self._balances_ttl)
 
         avg_costs = {}
         if include_diagnostics:
@@ -402,13 +402,13 @@ class KrakenPortfolio:
             avg_costs_ld = self.average_costs_from_ledgers()
             avg_costs = {
                 a: (avg_costs_tr.get(a) if avg_costs_tr.get(a) is not None else avg_costs_ld.get(a))
-                for a in set(list(avg_costs_tr.keys()) + list(avg_costs_ld.keys()) + list(bals.keys()))
+                for a in set(list(avg_costs_tr.keys()) + list(avg_costs_ld.keys()) + list(self.bals.keys()))
             }
 
         rows = []
         total_eur = 0.0
 
-        for code, qty in bals.items():
+        for code, qty in self.bals.items():
             alt = self.assets_info.get(code, {}).get("altname", code)
             px = self.price_in_eur(code)
             val = qty * px if (px is not None and not math.isnan(px)) else None
@@ -443,7 +443,7 @@ class KrakenPortfolio:
         """
         ZEUR disponibile meno EUR riservati da ordini BUY aperti su coppie quotate in EUR.
         """
-        bals = self.balances()
+        bals = self.bals if self.bals else self.balances()
         zeur_free = float(bals.get("ZEUR", 0.0))
 
         resp = self._kraken_call("OpenOrders", private=True, weight=3.0)
