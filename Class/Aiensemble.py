@@ -195,6 +195,28 @@ class GoalTracker:
         gap = max(0.0, (p["daily_target"] - p["daily_now"])) / max(1e-6, p["daily_target"])
         return float(np.clip(gap, 0.0, 1.0))
 
+
+        # --- NEW: persistenza dell'urgenza giornaliera ---
+    def _today_key(self):
+        d = datetime.utcnow().date()
+        return d.isoformat()
+
+    def set_urgency_today(self, val: float) -> None:
+        t = self._today_key()
+        st = self.state.setdefault("urgency", {})
+        st[t] = float(np.clip(val, 0.0, 1.0))
+        self._save()
+
+    def get_urgency_for_day(self, day: Optional[str] = None) -> float:
+        if day is None:
+            day = self._today_key()
+        try:
+            return float(self.state.get("urgency", {}).get(day) or 0.0)
+        except Exception:
+            return 0.0
+
+
+
 class ExposureContext:
     """
     Calcola esposizione netta per pair (posizione + ordini aperti).
@@ -1197,6 +1219,61 @@ class MomentumStrategy(Strategy):
         except Exception:
             return 0.0
 
+
+    # ----- helpers position/orders/goal (robusti su chiavi) -----
+    @staticmethod
+    def _pos_base(row: dict) -> float:
+        try:
+            pos = ((row.get("portfolio") or {}).get("position") or {})
+            return float(pos.get("base") or 0.0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _pending_delta_base_from_open_orders(row: dict) -> float:
+        """Somma BUY(+) e SELL(-) degli open_orders per avere il delta base 'in arrivo'."""
+        oo = row.get("open_orders") or row.get("opens_orders") or []
+        delta = 0.0
+        for o in oo:
+            try:
+                side = (o.get("type") or o.get("side") or "").lower()
+                vol  = float(o.get("volume") or o.get("vol") or o.get("qty") or o.get("vol_rem") or 0.0)
+                if side == "buy":  delta += vol
+                elif side == "sell": delta -= vol
+            except Exception:
+                continue
+        return float(delta)
+
+    @staticmethod
+    def _goal_ctx(row: dict) -> tuple[float, bool, bool]:
+        """
+        Ritorna (urgency 0..1, near_daily, near_weekly).
+        1) prova dal 'row' (cur["_goal_urgency"])
+        2) fallback al file goal_state.json se non presente
+        """
+        near_d = bool(row.get("near_daily_target"))
+        near_w = bool(row.get("near_weekly_target"))
+
+        # 1) dal payload (iniettato al punto 2B)
+        urg = row.get("_goal_urgency")
+        try:
+            urg = float(urg)
+        except Exception:
+            urg = None
+
+        # 2) fallback dal file (se non in payload)
+        if urg is None:
+            try:
+                st = safe_read_json(GOAL_STATE_PATH) or {}
+                t = datetime.utcnow().date().isoformat()
+                urg = float(st.get("urgency", {}).get(t) or 0.0)
+            except Exception:
+                urg = 0.0
+
+        return float(np.clip(urg, 0.0, 1.0)), bool(near_d), bool(near_w)
+
+
+
     def signal(self, row: Dict[str, Any]) -> float:
         info = row.get("info", {}) or {}
 
@@ -1234,9 +1311,38 @@ class MomentumStrategy(Strategy):
         if score > 0 and ch30 < 0:
             score *= self.downtrend_dampen
 
-        # ===== 5) Squash morbido e clip finale =====
-        score = float(np.tanh(score))                # mantiene dinamica senza saturare troppo
+        # ===== 5) Squash morbido =====
+        score = float(np.tanh(score))
+
+        # ===== 6) Position / OpenOrders / Goal AWARE (solo aggiunte, nessuna rimozione) =====
+        pos_base = self._pos_base(row)                                     # >0 long, <0 short
+        pend_base = self._pending_delta_base_from_open_orders(row)         # delta base in arrivo da ordini aperti
+        urg, near_d, near_w = self._goal_ctx(row)
+
+        # (a) Spinta a CHIUDERE/RIDURRE quando lo score è in disaccordo con la posizione attuale
+        #     Esempio: se sono long (pos_base>0) ma il momentum è <=0 → spingo il punteggio verso negativo.
+        #     Più urgenza ⇒ più voglia di rientrare a target (k_pos sale).
+        k_pos = 0.22 + 0.28 * urg
+        score += float(-k_pos * np.tanh(pos_base)) * (1.0 if score <= 0 else 0.5)
+        # Nota: se score è già negativo e sono long, l’effetto è pieno; se è positivo, è solo una lieve frenata.
+
+        # (b) Spinta a NON AUMENTARE se ho già ordini pendenti nella stessa direzione
+        #     Se lo score spinge buy e ho già BUY pendenti → attenua.
+        same_dir = np.sign(score) == np.sign(pend_base) and pend_base != 0.0
+        if same_dir:
+            k_pend = 0.20 + 0.20 * urg
+            score *= float(1.0 - np.clip(k_pend * np.tanh(abs(pend_base)), 0.0, 0.5))
+
+        # (c) Vicino ai target (daily/weekly) → favorisci TAKE-PROFIT, smorza aperture nella direzione del trend
+        if near_d or near_w:
+            k_goal = 0.18 if (near_d and near_w) else 0.12
+            score *= float(1.0 - k_goal)                 # meno voglia di aumentare
+            # se sono in posizione, aggiungi una leggera spinta opposta per promuovere chiusure parziali
+            score += float(-np.sign(pos_base) * 0.10)
+
+        # ===== 7) Clip finale =====
         return float(np.clip(score, -self.clip_abs, self.clip_abs))
+
 
 
 class ValueStrategy(Strategy):
@@ -2557,6 +2663,7 @@ class AIEnsembleTrader:
                 pass
 
             urg = float(self.goal.urgency_factor())           # 0..1
+            self.goal.set_urgency_today(urg)  # <-- NEW: persistiamo l’urgenza di oggi
             shaped = float(pnl_delta_total) * (1.0 + 0.2 * urg)
 
             # contributi pesati dai segnali del batch corrente
@@ -3491,7 +3598,19 @@ class AIEnsembleTrader:
         if self.capital_manager:
             port = self.refresh_portfolio()
             scored = []; sells_pool = []
+            # ---- NEW: goal progress + exposure context (una volta per batch)
+            urg = float(self.goal.get_urgency_for_day()) if hasattr(self, "goal") else 0.0
+            gprog = self.goal.progress() if hasattr(self, "goal") else {}
+            exp_ctx = self.exposure.build_for(self._currencies)
+
+            # prima di chiamare le strategie
             for cur in self._currencies:
+                pair = cur.get("pair") or cur.get("kr_pair")
+                                # annotazioni per il planner/strategie
+                cur["near_daily_target"]  = bool(gprog["daily_near"])
+                cur["near_weekly_target"] = bool(gprog["weekly_near"])
+                cur["_goal_urgency"] = float(urg)  # 0..1
+                cur["_exposure"] = exp_ctx.get(pair, {})
                 # PRIMA:  _, blend, _ = self._signals_for_currency(cur)
                 _, blend, *_ = self._signals_for_currency(cur)   # prende solo il 2° elemento
                 now = cur.get("info", {}).get("NOW", {})
@@ -3501,19 +3620,11 @@ class AIEnsembleTrader:
                     sells_pool.append((float(blend), cur, float(price)))
                 scored.append((float(blend), cur))
 
-            # ---- NEW: goal progress + exposure context (una volta per batch)
-            gprog = self.goal.progress()
-            exp_ctx = self.exposure.build_for(self._currencies)
 
             for cur in self._currencies:
                 pair = cur.get("pair") or cur.get("kr_pair")
                 if not pair:
                     continue
-                # annotazioni per il planner/strategie
-                cur["near_daily_target"]  = bool(gprog["daily_near"])
-                cur["near_weekly_target"] = bool(gprog["weekly_near"])
-                cur["_goal_urgency"] = float(self.goal.urgency_factor())  # 0..1
-                cur["_exposure"] = exp_ctx.get(pair, {})
 
             scored.sort(key=lambda x: x[0], reverse=True)
             for blend, cur in scored:
@@ -4248,6 +4359,7 @@ class ActionPlanner:
         if self.ai.debug_signals:
             print(f"[signals] {pair} -> blend={round(blended,3)}")
 
+        onWallet=False
         # BUY
         if blended >= self.ai.enter_thr:
             type = "buy"
@@ -4287,6 +4399,7 @@ class ActionPlanner:
         # SELL
         if abs(blended) > abs(self.ai.exit_thr) and blended < 0:
             type = "sell"
+
             if blended <= self.margin_sell_enter:
                 quando = "market"
                 motivo= "shorto brutto per blend alto"
@@ -4297,6 +4410,7 @@ class ActionPlanner:
                     reason = "short lev market"
                 else:
                     if avalaible_in_portfolio and avalaible_in_portfolio > req_min:
+                        onWallet=True
                         reason = "Take Profit"
                         if avalaible_in_portfolio > (req_min * 2):
                             qty = avalaible_in_portfolio * 0.33
@@ -4315,6 +4429,8 @@ class ActionPlanner:
             else:
                 limitBool = True
                 if avalaible_in_portfolio and avalaible_in_portfolio > req_min:
+                    limitBool = False
+                    onWallet=True
                     if avalaible_in_portfolio > (req_min * 2):
                         qty = avalaible_in_portfolio * 0.33
                         motivo="Prendo profitto parziale e libero quantità"
@@ -4343,7 +4459,9 @@ class ActionPlanner:
             fee = fee_in_crypto(qty,fees[0][1])
         else:
             fee = fee_in_crypto(qty,fees[1][1])
-        qty += fee
+
+        if onWallet == False:
+            qty += fee
         #
 
         qty_eur = float(price * qty)
@@ -4378,11 +4496,11 @@ class ActionPlanner:
 
                     # ... dopo aver deciso side e qty_base "grezza" ...
         # CAP con esposizione: non superare il cap_for_score in EUR
-        if price > 0:
+        if price > 0 and type != "hold" and onWallet == False:
             eur_desired = float(qty) * price
             room = max(0.0, cap_for_score - exposure_eur)
-            if room <= self.ai.min_order_eur:
-                return [ self.ai._mk_hold(cur, motivo="No room under exposure cap") ]
+            # if room <= self.ai.min_order_eur:
+            #     return [ self.ai._mk_hold(cur, motivo="No room under exposure cap") ]
             if eur_desired > room:
                 qty = room / price
 
