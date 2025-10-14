@@ -39,6 +39,45 @@ try:
 except Exception:
     pass
 
+
+# ---- DEVICE HELPER: CUDA -> DirectML -> CPU ----
+def get_torch_device():
+    try:
+        import torch
+        # 1) se un domani userai CUDA (NVIDIA)
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        # 2) AMD su Windows via DirectML
+        try:
+            import torch_directml
+            return torch_directml.device()   # device "dml"
+        except Exception:
+            pass
+        # 3) fallback CPU
+        return torch.device("cpu")
+    except Exception:
+        return "cpu"
+
+TORCH_DEVICE = get_torch_device()
+
+def to_device(x):
+    """Sposta tensori/modelli su TORCH_DEVICE quando possibile."""
+    try:
+        import torch
+        if hasattr(x, "to"):
+            return x.to(TORCH_DEVICE)
+    except Exception:
+        pass
+    return x
+
+try:
+    import torch
+    print(f"[AI] Torch device: {TORCH_DEVICE}")
+    if hasattr(torch, "directml"):
+        print("[AI] torch-directml attivo")
+except Exception:
+    pass
+
 # =============================================================
 # AIEnsembleTrader – ensemble con pesi adattivi + capital manager
 # (STATEFUL: istanzi una volta, poi passi currencies/actions a run()).
@@ -619,7 +658,8 @@ def train_tft_offline(hist_dir: str, model_dir: str,
                     input_chunk_length=128,
                     output_chunk_length=horizon,
                     n_epochs=n_epochs,
-                    random_state=42
+                    random_state=42,
+                    torch_device=str(TORCH_DEVICE),
                 )
                 used = "NHiTS"
                 qlist = None
@@ -640,7 +680,8 @@ def train_tft_offline(hist_dir: str, model_dir: str,
                         "cyclic": {"future": ["hour", "dayofweek"]},
                         "datetime_attribute": {"future": ["month"]},
                         "position": {"future": ["relative"]}
-                    }
+                    },
+                    torch_device=str(TORCH_DEVICE),   # <--- AGGIUNGI QUESTO
                 )
                 used = "TFT"
 
@@ -1036,6 +1077,7 @@ class TFTStrategy(Strategy):
 
 
     def _predict_edge(self, series: TimeSeries, row: dict) -> float:
+
         """Predice edge (%) con TFT o fallback"""
         last = float(series.univariate_values()[-1])
         path = self._model_path(row["pair"])
@@ -1054,6 +1096,11 @@ class TFTStrategy(Strategy):
             # se fallisce il load, ritorna neutro
             return 0.0
 
+        try:
+            model.to(str(TORCH_DEVICE))  # porta il modello sul device attivo
+        except Exception:
+            print('error')
+            pass
         # multi-horizon o singolo
         horizons = self.horizons if self.multi_horizon else [self.horizons[-1]]
         edges = []
@@ -1612,6 +1659,29 @@ class NeuralStrategy(Strategy):
             self.nn = None
             self._use_torch = False
 
+        # --- device helper (CUDA / DirectML / MPS / CPU) ---
+        try:
+            import torch_directml  # per AMD su Windows
+            _dml_dev = torch_directml.device()
+        except Exception:
+            _dml_dev = None
+
+        if self.torch.cuda.is_available():
+            self.device = self.torch.device("cuda")
+        elif _dml_dev is not None:
+            self.device = _dml_dev
+        elif hasattr(self.torch.backends, "mps") and self.torch.backends.mps.is_available():
+            self.device = self.torch.device("mps")
+        else:
+            self.device = self.torch.device("cpu")
+
+        def to_device(obj):
+            # tensori o modelli PyTorch
+            if hasattr(obj, "to"):
+                return obj.to(self.device)
+            return obj
+        self.to_device = to_device
+
         # try:
         #     import torch, torch.nn as nn  # type: ignore
         #     self.torch = __import__("torch")
@@ -1895,8 +1965,9 @@ class NeuralStrategy(Strategy):
             # print('thorch')
             torch, nn = self.torch, self.nn
             torch.manual_seed(int(self.params.get("seed", 42)))
-            Xtn = torch.tensor(Xn, dtype=torch.float32)
-            ytn = torch.tensor(yt, dtype=torch.float32).view(-1, 1)
+            # tensori su device
+            Xtn = torch.tensor(Xn, dtype=torch.float32, device=self.device)
+            ytn = torch.tensor(yt, dtype=torch.float32, device=self.device).view(-1, 1)
 
             class MLP(nn.Module):
                 def __init__(self, d_in, d_h):
@@ -1909,13 +1980,17 @@ class NeuralStrategy(Strategy):
                 def forward(self, x): return self.net(x)
 
             self.model = MLP(d_in=Xtn.shape[1], d_h=int(self.params.get("hidden", 32)))
+            self.model = self.to_device(self.model)  # <--- QUI
             opt = torch.optim.Adam(self.model.parameters(), lr=float(self.params.get("lr",1e-3)))
             loss_fn = nn.MSELoss()
 
             self.model.train()
             for _ in range(int(self.params.get("epochs", 60))):
-                opt.zero_grad(); pred = self.model(Xtn)
-                loss = loss_fn(pred, ytn); loss.backward(); opt.step()
+                opt.zero_grad()
+                pred = self.model(Xtn)         # Xtn è già sul device
+                loss = loss_fn(pred, ytn)      # ytn è già sul device
+                loss.backward()
+                opt.step()
         else:
             # print('no thorch')
             # fallback: tanh-regression con GD
@@ -2098,8 +2173,9 @@ class NeuralStrategy(Strategy):
         if self._use_torch and hasattr(self, "torch") and self.model is not None and not isinstance(self.model, tuple):
             self.model.eval()
             with self.torch.no_grad():
-                out = self.model(self.torch.tensor(Xn, dtype=self.torch.float32))
-            raw = float(np.clip(float(out.cpu().numpy().ravel()[0]), -1.0, 1.0))
+                x_t = self.torch.tensor(Xn, dtype=self.torch.float32, device=self.device)  # <---
+                out = self.model(x_t)
+            raw = float(np.clip(float(out.detach().cpu().numpy().ravel()[0]), -1.0, 1.0))
             return self._apply_guards_and_bias(raw, row)
 
         # 2) modello numpy (W,b)
@@ -2396,8 +2472,8 @@ class AIEnsembleTrader:
                  debug_signals: bool = False,
                  # policy allocator
                  capital_manager: bool = True,
-                 enter_thr: float = 0.56,
-                 exit_thr: float = -0.46,
+                 enter_thr: float = 0.50,
+                 exit_thr: float = -0.40,
                  strong_thr: float = 0.7,
                  use_market_for_strong: bool = True,
                  min_order_eur: float = 35.0,
