@@ -39,6 +39,45 @@ try:
 except Exception:
     pass
 
+
+# # ---- DEVICE HELPER: CUDA -> DirectML -> CPU ----
+# def get_torch_device():
+#     try:
+#         import torch
+#         # 1) se un domani userai CUDA (NVIDIA)
+#         if torch.cuda.is_available():
+#             return torch.device("cuda")
+#         # 2) AMD su Windows via DirectML
+#         try:
+#             import torch_directml
+#             return torch_directml.device()   # device "dml"
+#         except Exception:
+#             pass
+#         # 3) fallback CPU
+#         return torch.device("cpu")
+#     except Exception:
+#         return "cpu"
+
+# TORCH_DEVICE = get_torch_device()
+
+# def to_device(x):
+#     """Sposta tensori/modelli su TORCH_DEVICE quando possibile."""
+#     try:
+#         import torch
+#         if hasattr(x, "to"):
+#             return x.to(TORCH_DEVICE)
+#     except Exception:
+#         pass
+#     return x
+
+# try:
+#     import torch
+#     print(f"[AI] Torch device: {TORCH_DEVICE}")
+#     if hasattr(torch, "directml"):
+#         print("[AI] torch-directml attivo")
+# except Exception:
+#     pass
+
 # =============================================================
 # AIEnsembleTrader – ensemble con pesi adattivi + capital manager
 # (STATEFUL: istanzi una volta, poi passi currencies/actions a run()).
@@ -1036,6 +1075,7 @@ class TFTStrategy(Strategy):
 
 
     def _predict_edge(self, series: TimeSeries, row: dict) -> float:
+
         """Predice edge (%) con TFT o fallback"""
         last = float(series.univariate_values()[-1])
         path = self._model_path(row["pair"])
@@ -1612,6 +1652,29 @@ class NeuralStrategy(Strategy):
             self.nn = None
             self._use_torch = False
 
+        # # --- device helper (CUDA / DirectML / MPS / CPU) ---
+        # try:
+        #     import torch_directml  # per AMD su Windows
+        #     _dml_dev = torch_directml.device()
+        # except Exception:
+        #     _dml_dev = None
+
+        # if self.torch.cuda.is_available():
+        #     self.device = self.torch.device("cuda")
+        # elif _dml_dev is not None:
+        #     self.device = _dml_dev
+        # elif hasattr(self.torch.backends, "mps") and self.torch.backends.mps.is_available():
+        #     self.device = self.torch.device("mps")
+        # else:
+        #     self.device = self.torch.device("cpu")
+
+        # def to_device(obj):
+        #     # tensori o modelli PyTorch
+        #     if hasattr(obj, "to"):
+        #         return obj.to(self.device)
+        #     return obj
+        # self.to_device = to_device
+
         # try:
         #     import torch, torch.nn as nn  # type: ignore
         #     self.torch = __import__("torch")
@@ -1895,6 +1958,7 @@ class NeuralStrategy(Strategy):
             # print('thorch')
             torch, nn = self.torch, self.nn
             torch.manual_seed(int(self.params.get("seed", 42)))
+            # tensori su device
             Xtn = torch.tensor(Xn, dtype=torch.float32)
             ytn = torch.tensor(yt, dtype=torch.float32).view(-1, 1)
 
@@ -1909,6 +1973,7 @@ class NeuralStrategy(Strategy):
                 def forward(self, x): return self.net(x)
 
             self.model = MLP(d_in=Xtn.shape[1], d_h=int(self.params.get("hidden", 32)))
+            # self.model = self.to_device(self.model)  # <--- QUI
             opt = torch.optim.Adam(self.model.parameters(), lr=float(self.params.get("lr",1e-3)))
             loss_fn = nn.MSELoss()
 
@@ -2099,6 +2164,7 @@ class NeuralStrategy(Strategy):
             self.model.eval()
             with self.torch.no_grad():
                 out = self.model(self.torch.tensor(Xn, dtype=self.torch.float32))
+                out = self.model(x_t)
             raw = float(np.clip(float(out.cpu().numpy().ravel()[0]), -1.0, 1.0))
             return self._apply_guards_and_bias(raw, row)
 
@@ -2396,8 +2462,8 @@ class AIEnsembleTrader:
                  debug_signals: bool = False,
                  # policy allocator
                  capital_manager: bool = True,
-                 enter_thr: float = 0.56,
-                 exit_thr: float = -0.46,
+                 enter_thr: float = 0.50,
+                 exit_thr: float = -0.40,
                  strong_thr: float = 0.7,
                  use_market_for_strong: bool = True,
                  min_order_eur: float = 35.0,
@@ -4592,7 +4658,7 @@ class ActionPlanner:
                 if avalaible_in_portfolio and avalaible_in_portfolio > req_min:
                     limitBool = False
                     onWallet=True
-                    if avalaible_in_portfolio > (req_min * 2):
+                    if avalaible_in_portfolio > (req_min * 3):
                         qty = avalaible_in_portfolio * 0.33
                         motivo="Prendo profitto parziale e libero quantità"
                         reason = "Take Profit"

@@ -10,8 +10,35 @@ import pandas as pd
 # from darts.models import XGBModel
 # from darts.models import StatsForecastAutoARIMA, StatsForecastAutoETS, StatsForecastCroston
 # importa le TUE classi/funzioni
-from bot3 import Bot                              # <-- il tuo Bot
+# from bot3 import Bot
+# import torch
+# try:
+#     torch.set_float32_matmul_precision("high")
+# except Exception:
+#     pass                             # <-- il tuo Bot
 # from Class.ChatGpt import CurrencyAnalyzerForYourPayloadV3 as Analyzer
+
+
+# try:
+#     import torch
+#     import time
+#     from Aiensemble import TORCH_DEVICE   # se in altro modulo, importa il tuo helper
+
+#     x = torch.randn(8192, 8192)
+#     t0 = time.time()
+#     y = (x @ x).sum()
+#     y.backward() if y.requires_grad else None
+#     dt_cpu = time.time() - t0
+
+#     x = x.to(TORCH_DEVICE)
+#     t0 = time.time()
+#     y = (x @ x).sum()
+#     y.backward() if y.requires_grad else None
+#     dt_gpu = time.time() - t0
+
+#     print(f"[check] CPU matmul ~ {dt_cpu:.3f}s  |  {TORCH_DEVICE} matmul ~ {dt_gpu:.3f}s")
+# except Exception as e:
+#     print("[check] skip:", e)
 
 # Import delle classi locali
 from Class.InfoMarket import InfoMarket, InfoMarket2
