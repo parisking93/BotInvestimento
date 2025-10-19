@@ -3,7 +3,7 @@ import asyncio
 import time, os, json, math, threading, random, sys
 from dataclasses import asdict, is_dataclass
 from typing import Sequence, Tuple, Dict, Any, List, Optional
-
+from Class.Util import reconcile_shadow_with_query_orders
 # # root del progetto = cartella padre della cartella in cui si trova main.py
 # ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 # PKG  = os.path.join(ROOT, "_packages")
@@ -250,7 +250,7 @@ ALL_EXEC_REPORTS = []
 
 # 1) Sorgente STREAMING da InfoMarket2
 # istanzia InfoMarket2 in modalità streaming
-im2 = InfoMarket2(per_run=10, total=420, quote="EUR", verbose=True, only_positions=True)
+im2 = InfoMarket2(per_run=10, total=300, quote="EUR", verbose=True, only_positions=False)
 source_aiter = im2.stream_async()   # <--- async iterator di batch da 15 oggetti
 
 from dataclasses import asdict
@@ -267,6 +267,7 @@ async def judge_fn(item):
     # actions = await asyncio.to_thread(analyzer.analyze, batch_objs, 6)
     # actions =[]
     print(res_ai["scores"])
+    print("[TRM] azioni:", [ (a.get("pair"), a.get("action"), a.get("price"), a.get("size")) for a in actions ])
     # actions_json = [asdict(a) for a in actions]
     actions_json = []
 
@@ -308,14 +309,19 @@ async def deliver_fn(item):
     # print(res_ai["scores"])
 
     runner = KrakenOrderRunner(pair_map={s: s for s in symbols})
-    bodies = runner.build_bodies(actions, validate=False, auto_brackets=False)
+    bodies = runner.build_bodies(actions, validate=True, auto_brackets=False)
     test = runner.execute_bodies(bodies, timeout=0.8)
+
+
+    # NUOVO: logga le execution nel JSONL delle shadow actions
+    ai.log_execution_to_shadow(actions, test)
+
     ai.learn_price_size_from_results(bodies, test)  # <-- NOVITÀ
 
     # === NEW: aggiorna goal/pesi in modo idempotente leggendo SOLO i SELL nuovi di oggi ===
     pnl_delta = ai.update_goal_from_trades_incremental(batch_objs,actions)
     print(f"[deliver_fn#{batch_id}] pnl_delta_goal = {pnl_delta:.2f} EUR (incrementale)")
-    # report = ai.update_weights_from_kraken(actions_ai=actions, lookback_hours=72)
+    report = ai.update_weights_from_kraken(actions_ai=actions, lookback_hours=72)
 
     print('report')
 
@@ -340,7 +346,7 @@ async def deliver_fn(item):
     print(f"[deliver_fn#{batch_id}] done — bodies={len(bodies)}")
 
 cfg = PipelineConfig(
-    batch_size=10,
+    batch_size=20,
     max_in_flight_batches=4,
     judge_cfg=StageConfig(concurrency=2, timeout=200, retries=0),
     deliver_cfg=StageConfig(concurrency=2, timeout=90, retries=0),
@@ -357,6 +363,11 @@ async def main():
         judge_fn=judge_fn,
         deliver_fn=deliver_fn,
     )
+    krakeapi=ai._get_kraken_api_from_env()
+    base_dir = os.path.dirname(__file__)            # directory dove si trova main.py
+    log_path = os.path.join(base_dir, "storico_output", "trm_log", "shadow_actions.jsonl")
+    n = reconcile_shadow_with_query_orders(log_path, krakeapi, sleep_s=0.1)
+    print(f"[reconcile] aggiornati {n} record")
 
 
     print("\n[pipeline] COMPLETATA")

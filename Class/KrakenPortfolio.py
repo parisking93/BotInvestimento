@@ -63,8 +63,8 @@ class KrakenPortfolio:
         secret=None,
         rate_limit_sec=None,
         balances_ttl=30,
-        trades_ttl=150,
-        ledgers_ttl=100,
+        trades_ttl=50,
+        ledgers_ttl=50,
     ):
         self.k = krakenex.API(
             key=key or os.environ.get("KRAKEN_KEY"),
@@ -72,7 +72,7 @@ class KrakenPortfolio:
         )
 
         # Parametri da argomenti o da .env (con default sensati)
-        rl = rate_limit_sec or float(os.environ.get("KRAKEN_RATE_LIMIT_SEC", "2.5"))
+        rl = rate_limit_sec or float(os.environ.get("KRAKEN_RATE_LIMIT_SEC", "1.5"))
         self._rl = RateLimiter(min_interval=rl)
 
         self._balances_ttl = int(os.environ.get("KRAKEN_BALANCES_TTL", balances_ttl))
@@ -396,14 +396,14 @@ class KrakenPortfolio:
         self.bals = self.balances(self._balances_ttl)
 
         avg_costs = {}
-        if include_diagnostics:
-            # calcoli cost basis solo quando servono
-            avg_costs_tr = self.average_costs_from_trades()
-            avg_costs_ld = self.average_costs_from_ledgers()
-            avg_costs = {
-                a: (avg_costs_tr.get(a) if avg_costs_tr.get(a) is not None else avg_costs_ld.get(a))
-                for a in set(list(avg_costs_tr.keys()) + list(avg_costs_ld.keys()) + list(self.bals.keys()))
-            }
+        # if include_diagnostics:
+        #     # calcoli cost basis solo quando servono
+        #     avg_costs_tr = self.average_costs_from_trades()
+        #     avg_costs_ld = self.average_costs_from_ledgers()
+        #     avg_costs = {
+        #         a: (avg_costs_tr.get(a) if avg_costs_tr.get(a) is not None else avg_costs_ld.get(a))
+        #         for a in set(list(avg_costs_tr.keys()) + list(avg_costs_ld.keys()) + list(self.bals.keys()))
+        #     }
 
         rows = []
         total_eur = 0.0
@@ -413,10 +413,10 @@ class KrakenPortfolio:
             px = self.price_in_eur(code)
             val = qty * px if (px is not None and not math.isnan(px)) else None
 
-            avg_buy = avg_costs.get(code) if include_diagnostics else None
+            # avg_buy = avg_costs.get(code) if include_diagnostics else None
             pnl_pct = None
-            if include_diagnostics and avg_buy not in (None, 0) and px is not None and not math.isnan(px):
-                pnl_pct = (px - avg_buy) / avg_buy
+            # if include_diagnostics and avg_buy not in (None, 0) and px is not None and not math.isnan(px):
+            #     pnl_pct = (px - avg_buy) / avg_buy
 
             if val is not None:
                 total_eur += val
@@ -428,25 +428,25 @@ class KrakenPortfolio:
                     "qty": qty,
                     "px_EUR": px,
                     "val_EUR": val,
-                    "avg_buy_EUR": avg_buy if include_diagnostics else None,
-                    "pnl_pct": pnl_pct if include_diagnostics else None,
+                    "avg_buy_EUR": None,
+                    "pnl_pct": None,
                 }
             )
 
         rows.sort(key=lambda r: (r["val_EUR"] or 0), reverse=True)
         trades = self.trades_history() if include_diagnostics else []
         ledgers = self.ledgers() if include_diagnostics else {}
-        return rows, total_eur, trades, ledgers
+        return rows, total_eur, trades, ledgers, self.pairs_info
 
     # ----------------- EUR investibili -----------------
-    def investable_eur(self) -> float:
+    def investable_eur(self, openOrders = None) -> float:
         """
         ZEUR disponibile meno EUR riservati da ordini BUY aperti su coppie quotate in EUR.
         """
         bals = self.bals if self.bals else self.balances()
         zeur_free = float(bals.get("ZEUR", 0.0))
 
-        resp = self._kraken_call("OpenOrders", private=True, weight=3.0)
+        resp = self._kraken_call("OpenOrders", private=True, weight=3.0) if openOrders == None else openOrders
         open_orders = resp.get("result", {}).get("open", {}) or {}
 
         eur_reserved = 0.0

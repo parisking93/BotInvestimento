@@ -48,8 +48,12 @@ from Class.StrategyEngine import StrategyEngine
 from Class.Aiensemble import AIEnsembleTrader, train_lgbm_offline, NeuralStrategy, Strategy, TFTStrategy, train_tft_offline
 from Class.KrakenOrderRunner import KrakenOrderRunner
 from Pipeline import TradePipeline, PipelineConfig, StageConfig
-
+from Class.Trm_agent import TRMAgent, TRMConfig
+from Class.Training.trm_training import ShadowActionsDataset, TRMTrainer
 from Class.OpenOrder import JsonObjectIO, Currency
+from datetime import date
+
+
 RES_STATE_PATH = os.path.join(os.getcwd(), "ai_features_state.json")
 _RES_IDX = None  # cache
 
@@ -544,6 +548,26 @@ def _make_regular_timeseries_from_df(df, freq="min"):
 pipe = TradePipeline(cfg)
 
 if __name__ == "__main__":
+
+
+
+    # train TRM
+    # Da cambiare il path cfg
+    cfg = TRMConfig(log_path="/path/to/trm_log/shadow_actions.jsonl", device="cpu")
+    agent = TRMAgent(cfg)
+
+    # carica dati (tutti i file giornalieri nella cartella del log)
+    ds = ShadowActionsDataset(cfg.log_path)  # oppure dates=[date(2025,10,19)]
+
+    trainer = TRMTrainer(agent, lr=1e-3, pnl_scale=0.05, device=cfg.device)
+
+    for e in range(3):
+        tr = trainer.train_epoch(ds, mode="supervised")       # "reinforce_like" | "assisted"
+        print("epoch", e, "train_loss", tr)
+
+    trainer.save("/path/to/checkpoints/trm.pt")
+    # END train TRM
+
 
     cfg_dir = ensure_sibling_folder("currency")  # crea se manca
     neural = next(s for s in ai.strategies if s.name=="Neural")

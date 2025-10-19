@@ -232,6 +232,12 @@ class KrakenOrderRunner:
                 # se mai userai stop-limit/take-profit-limit, potrai aggiungere anche close[price2]
 
             body["_meta"] = {"from": "Action", "timeframe": tf, "motivo": motivo}
+            # Se l'azione porta già un decision id (es. creato dal TRM/planner), propagalo
+            dec_id = a.get("decision_id")
+            if not dec_id and isinstance(a.get("meta"), dict):
+                dec_id = a["meta"].get("decision_id")
+            if dec_id:
+                body["_decision_id"] = str(dec_id)
             bodies.append(body)
 
         return bodies
@@ -346,6 +352,33 @@ class KrakenOrderRunner:
                     resp = k.query_private("AddOrder", payload)
                 except Exception as e:
                     resp = {"error": [str(e)], "result": None}
+
+                echo = {
+                        "pair": body.get("pair"),
+                        "type": body.get("type"),
+                        "ordertype": body.get("ordertype"),
+                        "volume": body.get("volume"),
+                        "price": body.get("price"),
+                        "price2": body.get("price2"),
+                        "reduce_only": body.get("reduce_only"),
+                        "_decision_id": body.get("_decision_id"),
+                }
+                # prova ad estrarre un order id/txid dalla risposta Kraken
+                order_id = None
+                try:
+                    r = resp.get("result") or {}
+                    tx = r.get("txid")
+                    if isinstance(tx, list) and tx:
+                        order_id = tx[0]
+                    elif isinstance(tx, str):
+                        order_id = tx
+                except Exception:
+                    pass
+                resp = {
+                    "error": resp.get("error") or [],
+                    "result": resp.get("result"),
+                    "_echo": {**echo, "order_id": order_id},
+                }
                 results.append(resp)
 
                 if i < len(bodies) and timeout and timeout > 0:

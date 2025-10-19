@@ -9,6 +9,9 @@ from collections import deque
 from datetime import datetime, timedelta
 import re
 import math
+from .Trm_agent import TRMAgent, TRMConfig, FEATURE_NAMES
+from .Util import _shadow_jsonl_upsert_after, _jsonl_read_all, _jsonl_write_all, _shadow_daily_path, attach_currencies_to_decision
+
 # from darts.models import TFTModel
 # from darts.models import XGBModel
 # from darts.models import StatsForecastAutoARIMA, StatsForecastAutoETS, StatsForecastCroston
@@ -83,6 +86,23 @@ except Exception:
 # (STATEFUL: istanzi una volta, poi passi currencies/actions a run()).
 # =============================================================
 
+# === Strategy naming: display -> canonical ===
+DISPLAY2CANON = {
+    "Momentum": "momentum",
+    "Value": "value",
+    "Pairs": "pairs",
+    "ML": "ml",
+    "MeanRevSR": "meanrevsr",
+    "Neural": "neural",
+    "Inventor": "inventor",
+    "TrendPB": "trendpb",
+    "SqueezeBO": "squeezebo",
+    "Micro": "micro",
+    "LGBM": "lgbm",
+}
+CANON_STRATS = [
+    "momentum","value","pairs","ml","meanrevsr","neural","inventor","trendpb","squeezebo","micro","lgbm"
+]
 # --------------------- utils ---------------------
 def fee_in_crypto(qty, fee_rate):
     return float(qty) * float(fee_rate)
@@ -102,6 +122,14 @@ GOAL_STATE_PATH = os.path.join(os.getcwd(), "aiConfig", "goal_state.json")
 
 
 GOAL_JOURNAL_PATH = os.path.join(os.getcwd(), "aiConfig", "goal_journal.json")
+
+
+def log_trm_event(path, payload: dict):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 class GoalJournal:
     """
@@ -2562,7 +2590,27 @@ class AIEnsembleTrader:
             # TFTStrategy(),
             LGBMStrategy()
         ]
-
+        # self.trm = TRMAgent(TRMConfig(
+        #     feature_dim=len(FEATURE_NAMES),
+        #     hidden_dim=64,
+        #     mlp_hidden=128,
+        #     K_refine=3,
+        #     log_path="./logs/trm_events.jsonl",
+        #     device="cpu",
+        # ))
+        # dentro __init__ di AIEnsembleTrader
+        self.use_trm = True  # interruttore rapido
+        self.trm_cfg = TRMConfig(
+            feature_dim=None,     # verrà forzato dal TRMAgent alle FEATURES correnti
+            hidden_dim=64,
+            mlp_hidden=128,
+            K_refine=3,
+            max_actions_per_pair=2,
+            norm_eps=1e-6,
+            log_path=os.path.join(self.output_dir or ".", "trm_log", "shadow_actions.jsonl") if self.output_dir else None,
+            device="cpu"          # cambia in "cuda" se/quando vuoi
+        )
+        self.trm = TRMAgent(cfg=self.trm_cfg)
         weights_state = os.path.join(self.output_dir, "weights.json") if self.output_dir else None
         self.weights = AdaptiveWeights([s.name for s in self.strategies], cfg or WeightConfig(), state_path=weights_state)
         # self.weights.reset()
@@ -3045,6 +3093,71 @@ class AIEnsembleTrader:
                 except Exception:
                     continue
         return float(pnl)
+
+
+
+
+    def log_execution_to_shadow(self, bodies: list[dict], results: list[dict]) -> None:
+        try:
+            log_path = getattr(self.trm.cfg, "log_path", None)
+            if not log_path:
+                return
+            from datetime import datetime, timezone
+            ts = datetime.now(timezone.utc).isoformat()
+
+            for body, res in zip(bodies or [], results or []):
+                decision_id = body.get("_decision_id") or body.get("decision_id")
+
+                # estrai order_id dalla risposta di execute_bodies
+                order_id = None
+                try:
+                    order_id = (res.get("_echo") or {}).get("order_id") or order_id
+                except Exception:
+                    pass
+                if order_id is None:
+                    try:
+                        r = res.get("result") or {}
+                        tx = r.get("txid")
+                        if isinstance(tx, list) and tx:
+                            order_id = tx[0]
+                        elif isinstance(tx, str):
+                            order_id = tx
+                    except Exception:
+                        pass
+
+                payload = {
+                    "event_type": "execution",
+                    "ts": ts,
+                    "decision_id": decision_id,
+                    "pair": body.get("pair") or body.get("pairname"),
+                    "kraken_result": res,
+                    "order_id": order_id,
+                }
+
+                p_today = _shadow_daily_path(log_path)
+                day_before = datetime.now() - timedelta(days=1)
+                # 1) prova ad aggiornare il record 'decision' aggiungendo 'after'
+                ok = _shadow_jsonl_upsert_after(p_today, decision_id, payload)  # chiama con file NON aperto
+
+                if not ok:
+                    # prova anche su ieri, se la decisione è stata loggata il giorno prima
+                    p_yday = _shadow_daily_path(log_path, day_before)
+                    if p_yday and os.path.exists(p_yday):
+                        ok = _shadow_jsonl_upsert_after(p_yday, decision_id, payload)
+                if not ok:
+                    # 2) fallback: append come nuovo evento 'execution'
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+                # 3) aggiungi 'currencies' al record 'decision' (usa il pair del record nel file)
+                if decision_id:
+                    self._attach_currencies_to_decision(log_path, decision_id)
+
+        except Exception as e:
+            print(f"[AIEnsemble.log_execution_to_shadow] errore: {e}")
+
+
+
 
     # -------------------- signals/blend --------------------
 
@@ -3928,13 +4041,176 @@ class AIEnsembleTrader:
 
 
         # --- NEW: builder HOLD (nessun ordine, solo traccia decisionale) ---
+
+
+    def _build_blend_vector_for_row(self, row: dict) -> dict:
+        """
+        Restituisce un dict {canonical_name: signal_float} allineato a CANON_STRATS.
+        Prende i signals da meta[w_names] se presenti, altrimenti richiama le strategie locali.
+        """
+        # 1) prova da meta
+        meta = (row.get("meta") or {})
+        w_names = meta.get("w_names") or meta.get("weights_names") or None
+        signals = meta.get("signals") or None
+
+        sig_map = {}
+        if isinstance(w_names, list) and isinstance(signals, list) and len(w_names) == len(signals):
+            for name, val in zip(w_names, signals):
+                canon = DISPLAY2CANON.get(str(name), None)
+                if canon:
+                    try:
+                        sig_map[canon] = float(val)
+                    except Exception:
+                        sig_map[canon] = 0.0
+
+        # 2) fallback: calcola i segnali chiamando le tue strategie registrate
+        #    assumo che tu abbia self.strategies: List[Strategy] con .name e .signal(row)
+        if not sig_map:
+            for strat in getattr(self, "strategies", []):
+                disp = getattr(strat, "name", None)  # es. "Momentum", "LGBM", "SqueezeBO" ...
+                canon = DISPLAY2CANON.get(disp, None)
+                if not canon:
+                    continue
+                try:
+                    sig_map[canon] = float(strat.signal(row))
+                except Exception:
+                    sig_map[canon] = 0.0
+
+        # 3) riempi tutte le chiavi canoniche
+        out = {k: float(sig_map.get(k, 0.0)) for k in CANON_STRATS}
+        return out
+
+
+    def _strategy_weights_for_trm(self) -> dict:
+        """
+        Mappa i pesi correnti del tuo blend (self.weights) sui nomi canonici attesi dal TRM.
+        Supporta sia self.weights.names (display) sia posizionale.
+        """
+        out = {}
+        names_disp = []
+        weights_vec = []
+
+        try:
+            # i tuoi pesi hanno spesso self.weights.names + self.weights.weights_softmax
+            names_disp = list(getattr(self.weights, "names", []) or [])
+            weights_vec = list(getattr(self.weights, "weights_softmax", []) or [])
+        except Exception:
+            names_disp, weights_vec = [], []
+
+        # costruisci dict display->peso
+        disp2w = {}
+        for i, w in enumerate(weights_vec):
+            disp = names_disp[i] if i < len(names_disp) else None
+            if disp is None:
+                continue
+            try:
+                disp2w[str(disp)] = float(w)
+            except Exception:
+                pass
+
+        # proietta sui canonici
+        for canon in CANON_STRATS:
+            # risali al display che mappa su canon
+            # (reverse lookup)
+            disp = next((d for d, c in DISPLAY2CANON.items() if c == canon), None)
+            val = float(disp2w.get(disp, 0.0)) if disp else 0.0
+            out[f"w_{canon}"] = val
+
+        # Parametri operativi che il TRM usa nel decoder quantità/prezzo
+        out["max_quote_frac"] = float(getattr(self, "max_quote_frac", 0.12))   # % cassa quote max per trade
+        out["min_notional_eur"] = float(getattr(self, "min_notional_eur", 5.0))# notional minimo per ordine
+        return out
+
+
+    def _goal_state_for_trm(self) -> dict:
+        """
+        Recupera l’urgency e i flag near_daily/near_weekly che già usi per goal.
+        Puoi mappare direttamente self.goal.progress() o leggere dal file stato.
+        """
+        try:
+            prog = self.goal.progress()  # {"urgency":..., "near_daily_target":..., ...}
+        except Exception:
+            prog = {}
+        return {
+            "urgency": float(prog.get("urgency", 0.0)),
+            "near_daily_target": bool(prog.get("near_daily_target", False)),
+            "near_weekly_target": bool(prog.get("near_weekly_target", False)),
+        }
+
+    def _collect_trm_batch(self):
+        """
+        Costruisce i 4 blocchi che il TRM si aspetta:
+        rows, blends (uno per row), goal_state (comune), strategy_weights (comuni).
+        """
+        rows = list(self._currencies or [])
+        blends = [self._build_blend_vector_for_row(r) for r in rows]
+        goal_state = self._goal_state_for_trm()
+        strategy_weights = self._strategy_weights_for_trm()
+        return rows, blends, goal_state, strategy_weights
+
+    # Aiensemble.py (dentro la classe AIEnsembleTrader)
+    def _attach_currencies_to_decision(self, log_path: str, decision_id: str) -> bool:
+        return attach_currencies_to_decision(log_path, decision_id, getattr(self, "_currencies", []))
+
+
+    def _suggest_via_trm(self) -> list:
+        """
+        Entry-point usato da run() quando use_trm=True.
+        1) raccoglie features
+        2) bootstrap norm (solo all’avvio o ogni N batch)
+        3) chiede le azioni al TRM
+        4) traduce in formato 'actions_ai' che il tuo Runner capisce
+        """
+        rows, blends, goal_state, strategy_weights = self._collect_trm_batch()
+
+        # bootstrap del normalizzatore: fallo la prima volta o ogni X giri
+        if not getattr(self, "_trm_bootstrapped", False):
+            # una singola passata: il TRM fa running update interno, non serve grande storia
+            self.trm.bootstrap_norm(rows[:64], blends[:64], goal_state, strategy_weights)
+            self._trm_bootstrapped = True
+
+        # trm_actions = self.trm.propose_actions_for_batch(
+        #     rows=rows, blends=blends,
+        #     goal_state=goal_state, strategy_weights=strategy_weights,
+        #     K=None, shadow_log=True
+        # )
+        # Converti TRM.Action -> tuo dict "actions_ai"
+        # out = []
+        trm_out_legacy = self.trm.propose_actions_legacy(
+            rows=rows, blends=blends,
+            goal_state=goal_state, strategy_weights=strategy_weights,
+            K=None, shadow_log=True
+        )
+        return trm_out_legacy
+        # for a in trm_actions:
+        #     # a.as_dict() è già pulito; mappa ai campi che usa KrakenOrderRunner
+        #     out.append({
+        #         "symbol": a.pair,
+        #         "pair": a.pair,
+        #         "action": a.side,      # "buy"|"sell"
+        #         "price": a.price,      # limit
+        #         "size": a.qty,         # qty base
+        #         "ordertype": "limit",
+        #         "timeinforce": a.time_in_force,
+        #         "take_profit": a.take_profit,
+        #         "stop_loss": a.stop_loss,
+        #         "leverage": a.leverage,
+        #         "meta": {
+        #             "source": "TRM",
+        #             "score": a.score,
+        #             # opzionale: includi segnali & pesi che hai usato per audit
+        #             # "blend": blends[...]  # se vuoi loggare pair→blend
+        #         }
+        #     })
+        # return out
+
     def _mk_hold(
         self,
         cur_or_pair,
         motivo: str = "Hold",
         meta: dict | None = None,
         tf: str = "24H",
-    ):
+        ):
         """
         Crea una 'azione' di tipo HOLD (non genera body per Kraken).
         Accetta:
@@ -4006,7 +4282,10 @@ class AIEnsembleTrader:
                 self._session_quote_left = float(self.per_trade_cap_eur or 0.0)
 
 
-        actions_out = self.suggest_all()
+        if self.use_trm:
+            actions_out = self._suggest_via_trm()
+        else:
+            actions_out = self.suggest_all()
         out = {
             "scores": self.weights.scores(),
             "actions_ai": actions_out,
@@ -4068,7 +4347,7 @@ class AIEnsembleTrader:
     def update_weights_from_kraken(self, actions_ai: List[Dict[str, Any]], lookback_hours: int = 24) -> Dict[str, Any]:
         # 1) (facoltativo) tieni pure la lettura kraken se ti serve altrove,
         #    ma NON usarla per il goal:
-        k = self._get_kraken_api_from_env()
+        # k = self._get_kraken_api_from_env()
         end_ts = int(time.time()); start_ts = end_ts - int(lookback_hours * 3600)
 
         # 2) PnL per i pesi — puoi continuare a usare i ledger come "feedback grezzo" se ti piace,

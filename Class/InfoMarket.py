@@ -594,7 +594,8 @@ class InfoMarket:
         with_or: bool = True,
         save_folder: str = "currency",
         sleep_per_call: float = 0.03,
-        sleep_per_pair: float = 0.01
+        sleep_per_pair: float = 0.01,
+        AssetPair = None
     ) -> List[Dict[str, Any]]:
         """
         Export completo per più coppie. **PATCH**: ora accetta sia kr-codes
@@ -604,11 +605,11 @@ class InfoMarket:
             ranges = ["NOW","1M","5M","15M","30M","1H","24H","30D","90D","1Y"]
 
         # --- AssetPairs una volta (serve per tradurre kr-code -> wsname) ---
-        ap_all = self._public("AssetPairs")
+        ap_all = self._public("AssetPairs") if AssetPair == None else AssetPair
 
         if ap_all.get("error"):
             print(f"[InfoMarket] skip invalid pairs in AssetPairs: {ap_all['error']}")
-        ap_map = ap_all.get("result", {}) or {}
+        ap_map = (ap_all.get("result", {}) or {}) if AssetPair == None else AssetPair
 
         def _to_human(p: str) -> str:
             """Se p è un kr-code, usa wsname per restituire 'BASE/QUOTE';
@@ -970,14 +971,16 @@ class InfoMarket2:
         """
         print("\n========== KrakenPortfolio: portafoglio ==========")
         kp = KrakenPortfolio()
-        rows, total, trades, ledgers = kp.portfolio_view()
+        rows, total, trades, ledgers, AssetPair = kp.portfolio_view()
 
         # salva negli attributi
         self.portfolio_rows = rows
         self.portfolio_total = total
         self.portfolio_trades = trades
         self.portfolio_ledgers = ledgers
-        self.portfolioIn = kp.investable_eur()
+        self.AssetPair = AssetPair
+
+        # self.portfolioIn = kp.investable_eur()
 
 
 
@@ -988,6 +991,7 @@ class InfoMarket2:
         except Exception:
             open_orders = {}
 
+        self.portfolioIn = kp.investable_eur(resp_oo)
         try:
             resp_pos = kp.k.query_private('OpenPositions') or {}
             open_positions = (resp_pos.get('result') or {}) or {}
@@ -1237,7 +1241,7 @@ class InfoMarket2:
             pairs=human_pairs, quote=self.quote, ranges=ranges_use,
             with_liquidity=self.with_liquidity, with_mtf=True, with_or=True,
             max_pairs=len(human_pairs), depth_top_n=25,
-            sleep_per_call=0.0, sleep_per_pair=0.0
+            sleep_per_call=0.0, sleep_per_pair=0.0, AssetPair=self.AssetPair
         )
         # Calcolo MTF robusto per il batch e iniezione nei blocchi
         mtf_map = self._mtf_for_block(kr_list)
@@ -1251,11 +1255,13 @@ class InfoMarket2:
         open_positions_raw = snap.get("open_positions") or {}
         account_totals = snap.get("account_totals") or {}
         # indicizza rows per asset code (es. 'XXBT', 'ZEUR', ecc.)
-        portfolio_by_code = {}
-        for r in rows:
-            code = r.get("code")
-            if code:
-                portfolio_by_code[code] = r
+        # portfolio_by_code = {}
+        # for r in rows:
+        #     code = r.get("code")
+        #     if code:
+        #         portfolio_by_code[code] = r
+
+
 
         # reverse per normalizzare qualsiasi rappresentazione del pair in kr_code canonico
         rev_by_alt = {}
