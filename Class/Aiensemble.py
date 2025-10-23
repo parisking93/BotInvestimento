@@ -2608,7 +2608,8 @@ class AIEnsembleTrader:
             max_actions_per_pair=2,
             norm_eps=1e-6,
             log_path=os.path.join(self.output_dir or ".", "trm_log", "shadow_actions.jsonl") if self.output_dir else None,
-            device="cpu"          # cambia in "cuda" se/quando vuoi
+            device="cpu",          # cambia in "cuda" se/quando vuoi
+            total_budget_quote=budget_eur
         )
         self.trm = TRMAgent(cfg=self.trm_cfg)
         weights_state = os.path.join(self.output_dir, "weights.json") if self.output_dir else None

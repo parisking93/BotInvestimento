@@ -285,7 +285,10 @@ class TRMConfig:
     norm_eps: float = 1e-6
     log_path: Optional[str] = None
     device: str = "cpu"
-
+    total_budget_quote: Optional[float] = None
+    reserve_frac: float = 0.20                   # 20% riserva
+    super_conf_score: float = 0.85               # soglia "super convinta" su score (tanh ∈ [-1,1])
+    super_conf_sideprob: float = 0.65
 
 # -----------------------------
 # Running normalizer
@@ -424,6 +427,26 @@ class TinyRecursiveModel(nn.Module):
 
                 # size & vincoli
                 frac = max(min(float(qty_frac[i].item()), max_qfrac), 0.02)
+                # NEW: budget esterno 80/20 + gate "super convinta"
+                budget_total = _f((aux.get("budget_total_quote") or [0.0])[i], 0.0)
+                if budget_total > 0.0:
+                    reserve_frac   = float((aux.get("reserve_frac") or [0.20])[i])
+                    normal_frac    = max(0.0, 1.0 - reserve_frac)
+
+                    # confidenza del modello sul lato selezionato
+                    side_probs = torch.softmax(logits_side[i], dim=-1)
+                    chosen_p   = float(torch.max(side_probs).item())
+                    sc         = float(score[i].item())
+                    sc_gate    = float((aux.get("super_conf_score") or [0.85])[i])
+                    sp_gate    = float((aux.get("super_conf_sideprob") or [0.65])[i])
+
+                    super_convinta = (sc >= sc_gate) and (chosen_p >= sp_gate)
+
+                    usable_frac_on_budget = normal_frac + (reserve_frac if super_convinta else 0.0)
+                    free_quote_eff = budget_total * usable_frac_on_budget
+                else:
+                    # fallback: vecchio comportamento su free_quote dal row
+                    free_quote_eff = free_quote
                 notional = free_quote * frac
                 if notional < min_notional and free_quote > 0.0:
                     notional = min_notional
@@ -660,6 +683,12 @@ class TRMAgent:
     def propose_actions_for_batch(self, rows: List[Dict[str,Any]], blends: List[Dict[str,Number]], goal_state: Dict[str,Any], strategy_weights: Dict[str,Number], K: Optional[int] = None, shadow_log: bool = True) -> List[Action]:
         assert len(rows) == len(blends), "rows/blends length mismatch"
         X, aux = featurize_batch(rows, blends, goal_state, strategy_weights)
+        B = len(rows)
+        if self.cfg.total_budget_quote is not None and B > 0:
+            aux["budget_total_quote"]    = [float(self.cfg.total_budget_quote)] * B
+            aux["reserve_frac"]          = [float(self.cfg.reserve_frac)] * B
+            aux["super_conf_score"]      = [float(self.cfg.super_conf_score)] * B
+            aux["super_conf_sideprob"]   = [float(self.cfg.super_conf_sideprob)] * B
         X = X.to(self.cfg.device)
         self.model.norm.update(X)
         Xn = self.model.norm(X)
