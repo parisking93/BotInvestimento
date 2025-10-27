@@ -89,6 +89,81 @@ def _hash_idx(key: str, dim: int) -> int:
     h = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(h, "little") % dim
 
+
+
+class DailyMemory:
+    """
+    Carica dal file shadow_actions della data odierna info semplici:
+    - per pair: last_side, last_price, last_score, last_decision_ts
+    - conteggi buy/sell/hold del giorno
+    """
+    def __init__(self):
+        self.by_pair = {}
+        self.counts = {}
+
+    @staticmethod
+    def _today_path(base_dir: str) -> str:
+        # se hai già un helper _shadow_daily_path usa quello
+        if base_dir:
+            base_dir = os.path.join(base_dir, "shadow_actions.jsonl")
+        try:
+            return _shadow_daily_path(base_dir)  # già presente nel tuo Util
+        except Exception:
+            # fallback: unico file
+            return os.path.join(base_dir, "shadow_actions.jsonl")
+
+    def load_today(self, base_dir: str) -> None:
+        path = self._today_path(base_dir)
+        self.by_pair, self.counts = {}, {}
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                act = (rec.get("action") or {})
+                pair = act.get("pair") or ((rec.get("pair")) if isinstance(rec.get("pair"), str) else None)
+                side = act.get("side")
+                px   = act.get("price")
+                sc   = act.get("score")
+                ts   = rec.get("ts") or rec.get("timestamp")
+                if not pair:
+                    continue
+                # aggiorna ultimo
+                self.by_pair[pair] = {"last_side": side, "last_price": px, "last_score": sc, "last_ts": ts, "last_entry_price": act.get("prezzo") or act.get("price"), "last_take_profit": act.get("take_profit") or act.get("tp")}
+                # conteggi
+                c = self.counts.get(pair, {"buy":0, "sell":0, "hold":0})
+                if side in c:
+                    c[side] += 1
+                self.counts[pair] = c
+
+    def memory_feats_for(self, pair: str) -> dict:
+        info = self.by_pair.get(pair, {})
+        cnt  = self.counts.get(pair, {"buy":0, "sell":0, "hold":0})
+        # ritorna feature “piatte” pronte per hashing
+        ls = info.get("last_side")
+        side_onehot = {"buy":0.0,"sell":0.0,"hold":0.0}
+        if ls in side_onehot: side_onehot[ls] = 1.0
+        return {
+            "mem.last_side_buy": side_onehot["buy"],
+            "mem.last_side_sell": side_onehot["sell"],
+            "mem.last_side_hold": side_onehot["hold"],
+            "mem.last_price": float(info.get("last_price") or 0.0),
+            "mem.last_score": float(info.get("last_score") or 0.0),
+            "mem.cnt_buy": float(cnt["buy"]),
+            "mem.cnt_sell": float(cnt["sell"]),
+            "mem.cnt_hold": float(cnt["hold"]),
+            "mem.last_entry_price": float(info.get("last_entry_price") or 0.0),
+            "mem.last_take_profit": float(info.get("last_take_profit") or 0.0),
+        }
+
+
+
 class AutoFeaturizer:
     """
     Trasforma row/blend/goal/weights in vettore fissato da feature hashing.
@@ -245,11 +320,60 @@ class AutoFeaturizer:
             self._add(vec, "derived.or_pos:num", or_pos)
             self._add(vec, "derived.or_w:num", or_w)
 
+        # --- NEW: 1) Liquidity imbalance & total (safe-scaled) ---
+        liq_bid = self._num(now.get("liquidity_bid_sum"))
+        liq_ask = self._num(now.get("liquidity_ask_sum"))
+        liq_tot = liq_bid + liq_ask
+        liq_imb = ((liq_bid - liq_ask) / (abs(liq_tot) + 1e-12)) if liq_tot != 0.0 else 0.0
+        self._add(vec, "derived.liq_imbalance:num", liq_imb)
+        self._add(vec, "derived.liq_tot:num", (liq_tot / (abs(mid) + 1e-12)) if mid > 0 else 0.0)
+
+        # --- NEW: 2) Expected execution cost (bps) for buy/sell ---
+        spread_abs = (abs(ask - bid) if (ask > 0 and bid > 0) else 0.0)
+        half_spread_bps = (10000.0 * (0.5 * spread_abs / max(mid, 1e-12))) if mid > 0 else 0.0
+        slip_buy_bps  = 100.0 * self._num(now.get("slippage_buy_pct"))
+        slip_sell_bps = 100.0 * self._num(now.get("slippage_sell_pct"))
+        fee_maker = self._num((pl.get("fee_maker") or pl.get("maker_fee") or 0.001))
+        fee_taker = self._num((pl.get("fee_taker") or pl.get("taker_fee") or 0.001))
+        fee_taker_bps = 10000.0 * fee_taker
+        exp_cost_buy_bps  = half_spread_bps + slip_buy_bps  + fee_taker_bps
+        exp_cost_sell_bps = half_spread_bps + slip_sell_bps + fee_taker_bps
+        self._add(vec, "derived.exp_cost_buy_bps:num",  exp_cost_buy_bps)
+        self._add(vec, "derived.exp_cost_sell_bps:num", exp_cost_sell_bps)
+
+        # --- NEW: 3) Inventory & pending pressure ---
+        # pos_base stimata dal portfolio.row.qty (come nel dataset) e mid
+        pos_row = (pf.get("row") or {})
+        pos_base_qty = self._num(pos_row.get("qty"))
+        pos_val_eur = pos_base_qty * mid if mid > 0 else 0.0
+        inv_pressure = (pos_val_eur / (abs(free_quote) + 1e-9)) if free_quote > 0 else 0.0
+        # pendency: usa la tua funzione già calcolata (netto ordini aperti)
+        pend_pressure = (abs(pos_margin_base) / (abs(pos_base_qty) + abs(free_base) + 1e-9))
+        self._add(vec, "derived.inv_pressure:num", inv_pressure)
+        self._add(vec, "derived.pend_pressure:num", pend_pressure)
+
+        # --- NEW: 4) Momentum agreement multi-timeframe ---
+        def _chg(tf: str) -> float:
+            blk = (info.get(tf) or {})
+            return self._num(blk.get("change_pct"))
+        pos_cnt = neg_cnt = tot_cnt = 0
+        for tf in ["5M", "30M", "1H", "4H", "24H", "48H"]:
+            c = _chg(tf)
+            if c > 0:  pos_cnt += 1; tot_cnt += 1
+            elif c < 0: neg_cnt += 1; tot_cnt += 1
+            elif c == 0: tot_cnt += 1  # conta il flat per stabilizzare il denominatore
+        mom_agree = (pos_cnt - neg_cnt) / float(tot_cnt or 1)
+        self._add(vec, "derived.mtf_mom_agreement:num", mom_agree)
+
+        # --- NEW: cross utile tra i due regimi che già calcoli sopra ---
+        self._add(vec, "derived.trendXvol:num", float(trend_bias) * float(vol_regime))
+
+
         return vec, aux
 
 # Flag per attivare il featurizer schema-free
 USE_HASH_FEATS = True
-HASH_DIM = 2048  # puoi portarlo a 1024/2048 se vuoi più capacità
+HASH_DIM = 4096 # puoi portarlo a 1024/2048 se vuoi più capacità
 
 @dataclass
 class Action:
@@ -265,9 +389,15 @@ class Action:
     reduce_only: bool = False     # <-- nuovo
     score: float = 0.0
     notes: Optional[str] = "TRM proposal"
+    _side_prob: Optional[float] = None
+    _entropy: Optional[float] = None
 
-    def as_dict(self) -> Dict[str, Any]:
-        return {k:v for k,v in asdict(self).items() if v is not None}
+    def as_dict(self, keep_none: bool = False) -> dict:
+        d = asdict(self)            # non rimuove None
+        if not keep_none:
+            # comportamento precedente: togli i None
+            d = {k: v for k, v in d.items() if v is not None}
+        return d
 
 
 
@@ -278,9 +408,9 @@ class Action:
 @dataclass
 class TRMConfig:
     feature_dim: int = 128
-    hidden_dim: int = 64
-    mlp_hidden: int = 128
-    K_refine: int = 3
+    hidden_dim: int = 128
+    mlp_hidden: int = 256
+    K_refine: int = 4
     max_actions_per_pair: int = 2
     norm_eps: float = 1e-6
     log_path: Optional[str] = None
@@ -289,7 +419,8 @@ class TRMConfig:
     reserve_frac: float = 0.20                   # 20% riserva
     super_conf_score: float = 0.85               # soglia "super convinta" su score (tanh ∈ [-1,1])
     super_conf_sideprob: float = 0.65
-
+    run_currencies_left: Optional[int] = None
+    memory_path: Optional[str] = None
 # -----------------------------
 # Running normalizer
 # -----------------------------
@@ -380,8 +511,6 @@ class TinyRecursiveModel(nn.Module):
         tif_idx  = torch.argmax(self.head_tif(y), dim=-1)
         lev      = F.softplus(self.head_lev(y)).squeeze(-1) + 1.0
         score    = torch.tanh(self.head_score(y)).squeeze(-1)
-        lev      = F.softplus(self.head_lev(y)).squeeze(-1) + 1.0
-        score    = torch.tanh(self.head_score(y)).squeeze(-1)
         ord_logits = self.head_ordertype(y)                 # [B,2]
         ord_idx    = torch.argmax(ord_logits, dim=-1)       # 0=limit, 1=market
         p_reduce   = torch.sigmoid(self.head_reduce(y)).squeeze(-1)  # 0..1
@@ -402,58 +531,95 @@ class TinyRecursiveModel(nn.Module):
             min_notional = float(aux.get("min_notional_eur", [5.0])[i] if isinstance(aux.get("min_notional_eur"), list) else aux.get("min_notional_eur", 5.0))
 
             side_idx = int(torch.argmax(p_side[i]).item())   # 0=buy, 1=sell, 2=hold
-            tif_map = {0:"IOC", 1:"FOK", 2:"GTC"}
+            p_hat = float(p_side[i, side_idx].item())
+            H = float((-(p_side[i] * torch.log(p_side[i] + 1e-12)).sum()).item())  # entropia
+
+            is_buy = (side_idx == 0)
+            side = "buy" if is_buy else "sell"
+
+            anchor = bid if is_buy else ask
+            base_px = mid if mid > 0 else anchor
+            px = base_px * (1.0 + float(px_off[i].item()))
+            px = round(px, pair_dec)
 
             if side_idx == 2:
                 # --- HOLD: nessun ordine, qty 0, nessun TP/SL ---
                 actions.append(Action(
-                    pair=pair, side="hold", qty=0.0, price=None,
+                    pair=pair, side="hold", qty=0.0, price=px,
                     ordertype="none", take_profit=None, stop_loss=None,
-                    leverage=None, time_in_force="GTC", score=float(score[i].item())
+                    leverage=None, time_in_force="GTC", score=float(score[i].item()), _side_prob = p_hat, _entropy = H
                 ))
             else:
-                is_buy = (side_idx == 0)
-                side = "buy" if is_buy else "sell"
-
-                anchor = bid if is_buy else ask
-                base_px = mid if mid > 0 else anchor
-                px = base_px * (1.0 + float(px_off[i].item()))
-                px = round(px, pair_dec)
-
                 # TP/SL direzionati
                 tp = px * (1.0 + (float(tp_mult[i].item()) if is_buy else -float(tp_mult[i].item())))
                 sl = px * (1.0 - (float(sl_mult[i].item()) if is_buy else -float(sl_mult[i].item())))
                 tp = round(tp, pair_dec); sl = round(sl, pair_dec)
 
-                # size & vincoli
+                # size & vincoli (BUDGET-AWARE ma minimale: preserva il resto)
                 frac = max(min(float(qty_frac[i].item()), max_qfrac), 0.02)
-                # NEW: budget esterno 80/20 + gate "super convinta"
-                budget_total = _f((aux.get("budget_total_quote") or [0.0])[i], 0.0)
-                if budget_total > 0.0:
-                    reserve_frac   = float((aux.get("reserve_frac") or [0.20])[i])
-                    normal_frac    = max(0.0, 1.0 - reserve_frac)
 
-                    # confidenza del modello sul lato selezionato
-                    side_probs = torch.softmax(logits_side[i], dim=-1)
-                    chosen_p   = float(torch.max(side_probs).item())
-                    sc         = float(score[i].item())
-                    sc_gate    = float((aux.get("super_conf_score") or [0.85])[i])
-                    sp_gate    = float((aux.get("super_conf_sideprob") or [0.65])[i])
+                # --- cap globale opzionale (se passato da propose_actions_for_batch) ---
+                rb = None
+                rl = 0
+                try:
+                    # run_budget_quote/run_currencies_left sono replicati per ogni riga dal tuo TRMAgent
+                    # (vedi propose_actions_for_batch che li mette in aux). :contentReference[oaicite:0]{index=0}
+                    rb = float((aux.get("run_budget_quote") or [None])[i]) if ("run_budget_quote" in aux) else None
+                    rl = int((aux.get("run_currencies_left") or [0])[i]) if ("run_currencies_left" in aux) else 0
+                except Exception:
+                    rb, rl = None, 0
 
-                    super_convinta = (sc >= sc_gate) and (chosen_p >= sp_gate)
+                # knobs (con fallback alla cfg)
+                reserve_frac = float((aux.get("reserve_frac", [self.cfg.reserve_frac])[i] if isinstance(aux.get("reserve_frac"), list) else aux.get("reserve_frac", self.cfg.reserve_frac)))
+                super_sc = float((aux.get("super_conf_score", [self.cfg.super_conf_score])[i] if isinstance(aux.get("super_conf_score"), list)else aux.get("super_conf_score", self.cfg.super_conf_score)))
+                super_p = float((aux.get("super_conf_sideprob", [self.cfg.super_conf_sideprob])[i] if isinstance(aux.get("super_conf_sideprob"), list)else aux.get("super_conf_sideprob", self.cfg.super_conf_sideprob)))
 
-                    usable_frac_on_budget = normal_frac + (reserve_frac if super_convinta else 0.0)
-                    free_quote_eff = budget_total * usable_frac_on_budget
-                else:
-                    # fallback: vecchio comportamento su free_quote dal row
-                    free_quote_eff = free_quote
-                notional = free_quote * frac
-                if notional < min_notional and free_quote > 0.0:
-                    notional = min_notional
+                # 1) cap suggerito per-pair: equal-share sul budget residuo (al netto della riserva)
+                cap_hint = None
+                # se un piano esterno ti ha messo 'cap_eur_hint' per questa riga, usalo
+                if "cap_eur_hint" in aux and i < len(aux["cap_eur_hint"]):
+                    try:
+                        cap_hint = float(aux["cap_eur_hint"][i])
+                    except Exception:
+                        cap_hint = None
+
+                if cap_hint is None and rb is not None:
+                    budget_after_res = max(0.0, float(rb)) * max(0.0, 1.0 - float(reserve_frac))
+                    denom = float(max(1, int(rl) or 1))   # ATTENZIONE: qui rl è "quante currency restano" a livello RUN
+                    cap_hint = budget_after_res / denom
+
+                # 2) se segnale è super convinto, consenti un piccolo boost ma mai oltre il budget residuo
+                p_hat = float(torch.max(p_side[i, 0], p_side[i, 1]).item())
+                is_super = (abs(float(score[i].item())) >= super_sc) and (p_hat >= super_p)
+
+                cap_eur = cap_hint if (cap_hint is not None) else float('inf')
+                if is_super and (rb is not None):
+                    cap_eur = min(float(cap_eur) * 3.0, float(rb))
+
+                # 3) cap finale: per BUY prendi il min tra cassa locale e cap globale; per SELL non cappiamo la spesa (usa free_base)
+                notional_cap = float(free_quote)
+                if is_buy and (cap_eur != float('inf')):
+                    notional_cap = min(float(free_quote), float(cap_eur))
+
+                # notional come prima (manteniamo tutte le tue invarianti di prezzo/TP/SL/TIF)
+                notional = notional_cap * frac
+
+
+                # qty
                 qty = (notional / px) if px > 0 else 0.0
                 if not is_buy and free_base > 0:
-                    qty = min(qty if qty>0 else free_base, free_base)
+                    qty = min(qty if qty > 0 else free_base, free_base)
                 qty = round(qty, lot_dec)
+
+                # se non raggiungi i minimi exchange -> HOLD
+                if (qty <= 0.0) or (notional < min_notional):
+                    actions.append(Action(
+                        pair=pair, side="hold", qty=0.0, price=px,
+                        ordertype="none", take_profit=tp, stop_loss=None,
+                        leverage=None, time_in_force="GTC", score=float(score[i].item()), _side_prob = p_hat, _entropy = H
+                    ))
+                    continue
+
 
                 # ---- ordertype ----
                 oi = int(ord_idx[i].item())           # 0=limit, 1=market
@@ -465,13 +631,11 @@ class TinyRecursiveModel(nn.Module):
                 tif_out = "IOC" if ordertype == "market" else tif_map.get(int(tif_idx[i].item()), "GTC")
 
                 # ---- reduce_only ----
-                reduce_pred = bool(p_reduce[i].item() >= 0.5)
                 # regola gestionale: se stiamo vendendo con leva >= 2, forza reduce_only per evitare aperture short non desiderate
                 # ---- reduce_only con gate sulla posizione a leva ----
                 reduce_pred = bool(p_reduce[i].item() >= 0.5)
                 pos_m = _f(aux["pos_margin_base"][i], 0.0)
 
-                is_buy  = (side_idx == 0)
                 is_sell = (side_idx == 1)
 
                 # stai riducendo una posizione a leva solo se:
@@ -492,7 +656,8 @@ class TinyRecursiveModel(nn.Module):
                     # leverage=float(lev[i].item()),
                     time_in_force=tif_out,
                     reduce_only=reduce_only,
-                    score=float(score[i].item())
+                    score=float(score[i].item()),
+                    _side_prob = p_hat, _entropy = H
                 ))
 
 
@@ -611,7 +776,7 @@ _auto_feat = AutoFeaturizer(dim=HASH_DIM)
 
 def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
                     goal_state: Optional[Dict[str,Any]],
-                    strategy_weights: Dict[str,Number]) -> Tuple[torch.Tensor, Dict[str,List[Any]]]:
+                    strategy_weights: Dict[str,Number], run_aux: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, Dict[str,List[Any]]]:
     if USE_HASH_FEATS:
         X = []
         aux = {k:[] for k in ["pair","mid","bid","ask","lot_decimals","pair_decimals",
@@ -619,6 +784,51 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
                                "slippage_in","slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur"]}
         for row, blend in zip(rows, blends):
             v, a = _auto_feat.featurize(row, blend, goal_state, strategy_weights)
+            # --- INIETTA segnali di contesto per il GRU (per ogni riga del batch) ---
+            # --- NEW: inietta feature di memoria (se presenti in run_aux) ---
+            if run_aux is not None and isinstance(run_aux.get("mem"), list):
+                idx = len(X)  # X è la lista vettori che stai costruendo: len(X) è l'indice corrente
+                if idx < len(run_aux["mem"]):
+                    m = run_aux["mem"][idx] or {}
+                    for k, val in m.items():
+                        try:
+                            _auto_feat._add(v, f"{k}:num", float(val))
+                        except Exception:
+                            pass
+            if run_aux is not None:
+                rb = float(run_aux.get("run_budget_quote") or 0.0)
+                rl = float(run_aux.get("run_currencies_left") or 0.0)
+                _auto_feat._add(v, "derived.run_budget_quote:num", rb)
+                _auto_feat._add(v, "derived.run_currencies_left:num", rl)
+                try:
+                    mems = (run_aux or {}).get("mem")
+                except Exception:
+                    mems = None
+                try:
+                    mid_now = float(a.get("mid")[0] if isinstance(a.get("mid"), list) else (a.get("mid") or 0.0))
+                except Exception:
+                    mid_now = 0.0
+
+                if isinstance(mems, list):
+                    idx = len(aux["pair"]) - 1
+                    if 0 <= idx < len(mems) and isinstance(mems[idx], dict):
+                        mcur = mems[idx]
+                        # dump mem.* come numeric
+                        for kk, vv in mcur.items():
+                            key = kk if str(kk).startswith("mem.") else f"mem.{kk}"
+                            try:
+                                _auto_feat._add(v, f"{key}:num", float(vv))
+                            except Exception:
+                                pass
+                        # derived: TP colpito ora?
+                        try:
+                            ls = mcur.get("last_side")
+                            tp = float(mcur.get("last_take_profit") or 0.0)
+                            if mid_now and tp:
+                                hit = 1.0 if ((ls == "buy" and mid_now >= tp) or (ls == "sell" and mid_now <= tp)) else 0.0
+                                _auto_feat._add(v, "mem.tp_hit_now:bool", hit)
+                        except Exception:
+                            pass
             X.append(v)
             for k in aux.keys(): aux[k].extend(a[k])
         X_t = torch.tensor(X, dtype=torch.float32)
@@ -669,10 +879,52 @@ class TRMAgent:
         self.model = TinyRecursiveModel(self.cfg)
         self.logger = JsonlLogger(self.cfg.log_path)
 
+        if self.cfg.memory_path is None and self.cfg.log_path:
+            base_dir = os.path.dirname(self.cfg.log_path)
+            self.cfg.memory_path = os.path.join(base_dir, "trm_memory.jsonl")
+
+        try:
+            # default_ckpt = os.path.join(os.getcwd(), "aiConfig", "trm_from_paired.ckpt")
+            # self.load_brain(default_ckpt)  # se non esiste, stampa un warning e continua
+            ckpt_path = self.cfg.__dict__.get("ckpt_path") \
+                    or os.path.join(os.getcwd(), "aiConfig", "trm_from_paired.ckpt")
+            self._safe_load_ckpt(ckpt_path)
+        except Exception:
+            pass
+
+        self.memory = DailyMemory()
+        # base dir del log (cartella che contiene i file giornalieri)
+        mem_dir = os.path.dirname(self.cfg.log_path) if self.cfg.log_path else os.path.join(os.getcwd(), "storico_output","trm_log")
+        self.memory.load_today(mem_dir)
+        print(f"[TRM] memoria giornaliera caricata da: {mem_dir}")
+
     def bootstrap_norm(self, rows: List[Dict[str,Any]], blends: List[Dict[str,Number]], goal_state: Dict[str,Any], strategy_weights: Dict[str,Number]) -> None:
-        X, _ = featurize_batch(rows, blends, goal_state, strategy_weights)
+        run_aux = {
+            "run_budget_quote": self.cfg.total_budget_quote,
+            "run_currencies_left": self.cfg.run_currencies_left,
+        }
+        X, _ = featurize_batch(rows, blends, goal_state, strategy_weights, run_aux=run_aux)
         with torch.no_grad():
             self.model.norm.update(X.to(self.cfg.device))
+
+    def _log_uncertain_decision_id(self, decision_id: str, confidence: float):
+        """
+        Logga solo la decision_id se la confidenza è bassa.
+        """
+        try:
+            base_dir = os.path.join(self.cfg.log_path, "trm_log")
+            os.makedirs(base_dir, exist_ok=True)
+            log_path = os.path.join(
+                base_dir, f"uncertain_decisions_{datetime.date.today():%Y_%m_%d}.jsonl"
+            )
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "decision_id": decision_id,
+                    "confidence": confidence
+                }) + "\n")
+        except Exception as e:
+            print(f"[WARN] could not log uncertain decision_id: {e}")
 
     def _seed_y0(self, Xn: torch.Tensor) -> torch.Tensor:
         B, D = Xn.shape
@@ -682,13 +934,28 @@ class TRMAgent:
     @torch.no_grad()
     def propose_actions_for_batch(self, rows: List[Dict[str,Any]], blends: List[Dict[str,Number]], goal_state: Dict[str,Any], strategy_weights: Dict[str,Number], K: Optional[int] = None, shadow_log: bool = True) -> List[Action]:
         assert len(rows) == len(blends), "rows/blends length mismatch"
-        X, aux = featurize_batch(rows, blends, goal_state, strategy_weights)
+        run_aux = {
+            "run_budget_quote": self.cfg.total_budget_quote,
+            "run_currencies_left": self.cfg.run_currencies_left,
+        }
+        # --- NEW: prepara le feature di memoria per ogni riga (pair) ---
+        mem_list = []
+        for row in rows:
+            pair = row.get("pair") or f"{row.get('base','?')}/{row.get('quote','?')}"
+            mem_list.append(self.memory.memory_feats_for(pair))
+        run_aux["mem"] = mem_list
+        X, aux = featurize_batch(rows, blends, goal_state, strategy_weights, run_aux=run_aux)
         B = len(rows)
+        # --- valori dinamici per run (budget/currencies) ---
         if self.cfg.total_budget_quote is not None and B > 0:
-            aux["budget_total_quote"]    = [float(self.cfg.total_budget_quote)] * B
-            aux["reserve_frac"]          = [float(self.cfg.reserve_frac)] * B
-            aux["super_conf_score"]      = [float(self.cfg.super_conf_score)] * B
-            aux["super_conf_sideprob"]   = [float(self.cfg.super_conf_sideprob)] * B
+            aux["run_budget_quote"]    = [float(self.cfg.total_budget_quote)] * B
+            aux["reserve_frac"]        = [float(self.cfg.reserve_frac)] * B
+            aux["super_conf_score"]    = [float(self.cfg.super_conf_score)] * B
+            aux["super_conf_sideprob"] = [float(self.cfg.super_conf_sideprob)] * B
+
+        if self.cfg.run_currencies_left is not None and B > 0:
+            aux["run_currencies_left"] = [int(self.cfg.run_currencies_left)] * B
+
         X = X.to(self.cfg.device)
         self.model.norm.update(X)
         Xn = self.model.norm(X)
@@ -748,13 +1015,25 @@ class TRMAgent:
         if shadow_log:
             for a in final:
                 decision_id = str(uuid.uuid4())
+
+                # Calcolo confidenza aggregata
+                p_hat = float(getattr(a, "_side_prob", 0.0))        # max softmax
+                H = float(getattr(a, "_entropy", 0.0))              # entropia
+                H_norm = H / math.log(3.0)
+                score_abs = abs(float(getattr(a, "score", 0.0)))    # già in [-1,1]
+                conf = p_hat * (1.0 - max(0.0, min(1.0, H_norm))) * (0.5 + 0.5*score_abs)
+                if conf < 0.60:
+                    a.side = "hold"
+                    self._log_uncertain_decision_id(decision_id, conf)
+                # End Calcolo confidenza aggregata
+
                 meta_in = pair2input.get(a.pair, {"inputs": {}, "blend": {}})
                 payload = {
                     "event_type": "decision",
                     "ts": _iso_now(),
                     "decision_id": decision_id,
                     "pair": a.pair,
-                    "action": a.as_dict(),
+                    "action": a.as_dict(keep_none=True),
                     "score": a.score,
                     "inputs": meta_in["inputs"],
                     "blend": meta_in["blend"],
@@ -765,6 +1044,25 @@ class TRMAgent:
                 self.logger.log(payload)
                 # opzionale: attacca l'id all'azione così chi esegue può ributtarlo nel log ‘execution/close’
                 a.notes = (a.notes or "") + f" | decision_id={decision_id}"
+                # --- update stato dinamico nel cfg per le prossime run ---
+            try:
+                # spendo budget solo per i BUY (qty*prezzo)
+                spent = 0.0
+                for a in final:
+                    if a.side == "buy" and a.price is not None and a.reduce_only != True:
+                        spent += float(a.qty) * float(a.price)
+
+                    if a.side == "sell" and a.leverage is not None:
+                        spent += float(a.qty) * float(a.price)
+
+                if self.cfg.total_budget_quote is not None:
+                    self.cfg.total_budget_quote = max(float(self.cfg.total_budget_quote) - spent, 0.0)
+
+                # currency rimanenti = rimanenti - batch lavorato
+                if self.cfg.run_currencies_left is not None:
+                    self.cfg.run_currencies_left = max(int(self.cfg.run_currencies_left) - len(rows), 0)
+            except Exception:
+                pass
         return final
 
     @torch.no_grad()
@@ -805,7 +1103,52 @@ class TRMAgent:
             out_list.append(_legacy_one(row, a, blend_val, pair_dec))
         return out_list
 
+    # --- in Trm_agent.py, dentro la classe TRMAgent ---
+    def load_brain(self, ckpt_path: str) -> bool:
+        """
+        Carica i pesi addestrati (state_dict) da un checkpoint .ckpt.
+        Ritorna True se il caricamento è andato a buon fine.
+        """
+        try:
+            if not ckpt_path or not os.path.exists(ckpt_path):
+                print(f"[TRM] checkpoint non trovato: {ckpt_path}")
+                return False
+            chk = torch.load(ckpt_path, map_location=self.cfg.device)
+            state = chk.get("state_dict") or chk  # fallback, se salvato come puro state_dict
+            self.model.load_state_dict(state, strict=False)
+            self.model.to(self.cfg.device)
+            self.model.eval()  # in produzione normalmente eval()
+            # print facoltativo: un assaggio dei pesi
+            with torch.no_grad():
+                wsample = self.model.head_side.weight.view(-1)[:5].detach().cpu().numpy()
+            print("[TRM] brain loaded. head_side weight sample:", wsample)
+            return True
+        except Exception as e:
+            print(f"[TRM] errore load_brain: {e}")
+            return False
 
+    # === LOAD TRAINED BRAIN (.ckpt) ===
+    def _safe_load_ckpt(self, path: str):
+        if not path or not os.path.exists(path):
+            print(f"[TRM] ckpt non trovato: {path}")
+            return
+        ckpt = torch.load(path, map_location=self.cfg.device)
+        sd = ckpt.get("state_dict")
+        if not sd:
+            print("[TRM] ckpt senza 'state_dict'")
+            return
+        missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        self.model.to(self.cfg.device)
+        print("[TRM] mente caricata:", path)
+        if missing or unexpected:
+            print("[TRM] load_state warn -> missing:", missing, " | unexpected:", unexpected)
+        # opzionale: sneak peek di un head per verifica
+        try:
+            with torch.no_grad():
+                samp = self.model.head_side.weight.view(-1)[:6].detach().cpu().numpy().tolist()
+            print("[TRM] head_side weight sample:", samp)
+        except Exception:
+            pass
 # -----------------------------
 # Legacy serializer (schema ITA)
 # -----------------------------

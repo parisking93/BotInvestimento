@@ -13,6 +13,7 @@
 *.pt
 *.pth
 *.ckpt
+!**/trm_from_paired.ckpt
 *.txt
 
 # === Python ===
@@ -32,7 +33,7 @@ dist/
 .pyre/
 .coverage
 htmlcov/
-
+archive/
 # === Log e cache generiche ===
 logs/
 *.log

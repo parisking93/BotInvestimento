@@ -11,7 +11,7 @@ import re
 import math
 from .Trm_agent import TRMAgent, TRMConfig, FEATURE_NAMES
 from .Util import _shadow_jsonl_upsert_after, _jsonl_read_all, _jsonl_write_all, _shadow_daily_path, attach_currencies_to_decision
-
+import torch
 # from darts.models import TFTModel
 # from darts.models import XGBModel
 # from darts.models import StatsForecastAutoARIMA, StatsForecastAutoETS, StatsForecastCroston
@@ -2609,9 +2609,20 @@ class AIEnsembleTrader:
             norm_eps=1e-6,
             log_path=os.path.join(self.output_dir or ".", "trm_log", "shadow_actions.jsonl") if self.output_dir else None,
             device="cpu",          # cambia in "cuda" se/quando vuoi
-            total_budget_quote=budget_eur
+            total_budget_quote=budget_eur,
+            run_currencies_left=420
         )
         self.trm = TRMAgent(cfg=self.trm_cfg)
+        # # init brain trm
+        # ckpt_path = os.path.join(os.getcwd(), "aiConfig", "trm_from_paired.ckpt")
+        # ckpt = torch.load(ckpt_path, map_location=self.trm.cfg.device)
+        # self.trm.model.load_state_dict(ckpt["state_dict"])
+        # self.trm.model.to(self.trm.cfg.device)
+        # with torch.no_grad():
+        #     w = self.trm.model.head_side.weight.view(-1)[:5].cpu().numpy()
+        # print("[TRM] head_side weight sample:", w)
+        # # end init brain trm
+
         weights_state = os.path.join(self.output_dir, "weights.json") if self.output_dir else None
         self.weights = AdaptiveWeights([s.name for s in self.strategies], cfg or WeightConfig(), state_path=weights_state)
         # self.weights.reset()
@@ -3105,25 +3116,21 @@ class AIEnsembleTrader:
                 return
             from datetime import datetime, timezone
             ts = datetime.now(timezone.utc).isoformat()
-
-            for body, res in zip(bodies or [], results or []):
+            for body in bodies or []:
                 decision_id = body.get("_decision_id") or body.get("decision_id")
+                tipo = body.get("tipo")
+                res = {}; order_id = None
 
-                # estrai order_id dalla risposta di execute_bodies
-                order_id = None
-                try:
-                    order_id = (res.get("_echo") or {}).get("order_id") or order_id
-                except Exception:
-                    pass
-                if order_id is None:
+                if tipo != "hold":
+                    order_id = None
                     try:
-                        r = res.get("result") or {}
-                        tx = r.get("txid")
-                        if isinstance(tx, list) and tx:
-                            order_id = tx[0]
-                        elif isinstance(tx, str):
-                            order_id = tx
-                    except Exception:
+                        for resu in results:
+                            if resu.get("_echo") is not None and resu.get("_echo").get("pair") == body.get("pair"):
+                                res = resu; order_id = resu.get("_echo").get("order_id")
+                                if order_id is None and resu.get("result").get("txid") is not None:
+                                    order_id = resu.get("result").get("txid")
+                    except Exception as e:
+                        print(e)
                         pass
 
                 payload = {
@@ -3134,23 +3141,17 @@ class AIEnsembleTrader:
                     "kraken_result": res,
                     "order_id": order_id,
                 }
-
                 p_today = _shadow_daily_path(log_path)
                 day_before = datetime.now() - timedelta(days=1)
                 # 1) prova ad aggiornare il record 'decision' aggiungendo 'after'
-                ok = _shadow_jsonl_upsert_after(p_today, decision_id, payload)  # chiama con file NON aperto
+                ok = _shadow_jsonl_upsert_after(p_today, decision_id, payload)
 
                 if not ok:
                     # prova anche su ieri, se la decisione è stata loggata il giorno prima
                     p_yday = _shadow_daily_path(log_path, day_before)
                     if p_yday and os.path.exists(p_yday):
                         ok = _shadow_jsonl_upsert_after(p_yday, decision_id, payload)
-                if not ok:
-                    # 2) fallback: append come nuovo evento 'execution'
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-                # 3) aggiungi 'currencies' al record 'decision' (usa il pair del record nel file)
                 if decision_id:
                     self._attach_currencies_to_decision(log_path, decision_id)
 

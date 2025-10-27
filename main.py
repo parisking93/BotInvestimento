@@ -250,7 +250,7 @@ ALL_EXEC_REPORTS = []
 
 # 1) Sorgente STREAMING da InfoMarket2
 # istanzia InfoMarket2 in modalità streaming
-im2 = InfoMarket2(per_run=10, total=300, quote="EUR", verbose=True, only_positions=False)
+im2 = InfoMarket2(per_run=10, total=420, quote="EUR", verbose=True, only_positions=False)
 source_aiter = im2.stream_async()   # <--- async iterator di batch da 15 oggetti
 
 from dataclasses import asdict
@@ -266,8 +266,8 @@ async def judge_fn(item):
     actions = res_ai["actions_ai"]
     # actions = await asyncio.to_thread(analyzer.analyze, batch_objs, 6)
     # actions =[]
-    print(res_ai["scores"])
-    print("[TRM] azioni:", [ (a.get("pair"), a.get("action"), a.get("price"), a.get("size")) for a in actions ])
+    # print(res_ai["scores"])
+    # print("[TRM] azioni:", [ (a.get("pair"), a.get("action"), a.get("price"), a.get("size")) for a in actions ])
     # actions_json = [asdict(a) for a in actions]
     actions_json = []
 
@@ -330,7 +330,7 @@ async def deliver_fn(item):
 
     print('bodies')
 
-    for acts in bodies:
+    for acts in actions:
         print(acts)
 
     print('teswt')
