@@ -410,7 +410,7 @@ class TRMConfig:
     feature_dim: int = 128
     hidden_dim: int = 128
     mlp_hidden: int = 256
-    K_refine: int = 4
+    K_refine: int = 5
     max_actions_per_pair: int = 2
     norm_eps: float = 1e-6
     log_path: Optional[str] = None
