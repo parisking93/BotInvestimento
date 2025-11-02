@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, TYPE_CHECKING, List, Tuple, Set, Iterable
 import requests
 import asyncio, datetime as _dt
-from Class.KrakenPortfolio import KrakenPortfolio
-
+try:
+    from Class.KrakenPortfolio import KrakenPortfolio
+except ImportError:
+    from KrakenPortfolio import KrakenPortfolio
 
 
 # --- AGGIUNTA IN FONDO A InfoMarket.py ---------------------------------------

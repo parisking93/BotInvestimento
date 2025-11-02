@@ -18,7 +18,191 @@ import timesfm  # google-research/timesfm (PyTorch)
 from sklearn.preprocessing import StandardScaler
 from pathlib import Path
 import shutil
+# --- ADD: in cima ai import ---
+try:
+    from .InfoMarket import InfoMarket
+except Exception:
+    from Class.InfoMarket import InfoMarket
 
+import pandas as pd
+import time
+# --- in cima ---
+from typing import Optional
+
+
+# --- RE-ADD: reader per AIEnsemble ---
+from typing import Optional
+from pathlib import Path
+import os, json
+
+
+
+# --- SAFE PUBLIC + DISK CACHE PER ASSETPAIRS ---
+from functools import lru_cache
+import time, json
+from pathlib import Path
+
+_AP_CACHE_PATH = Path(__file__).resolve().parent.parent / "storico_output" / "_cache" / "kr_assetpairs.json"
+_AP_CACHE_TTL_S = 6 * 3600  # 6h
+
+def _safe_public(im, method: str, params: dict | None = None, retries: int = 4, base_sleep: float = 1.0) -> dict:
+    params = params or {}
+    last_err = None
+    for i in range(retries):
+        try:
+            return im._public(method, params)
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            # backoff aggressivo su 403/forbidden
+            if "403" in msg or "forbidden" in msg:
+                time.sleep(base_sleep * (2 ** i) + (0.2 * i))
+                continue
+            time.sleep(0.5 * (i + 1))
+    raise last_err
+
+def _load_ap_cache() -> dict | None:
+    try:
+        if not _AP_CACHE_PATH.exists():
+            return None
+        with open(_AP_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if time.time() - data.get("ts", 0) <= _AP_CACHE_TTL_S and "map" in data:
+            return data
+    except Exception:
+        return None
+    return None
+
+def _save_ap_cache(mapping: dict) -> None:
+    try:
+        _AP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_AP_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"ts": int(time.time()), "map": mapping}, f)
+    except Exception:
+        pass
+
+@lru_cache(maxsize=1)
+def _get_assetpairs_map(im) -> dict:
+    """Mappa 'HUMAN wsname' -> 'kr-code' (es. 'BTC/EUR' -> 'XXBTZEUR'), con cache process+disco."""
+    # 1) prova cache su disco
+    cached = _load_ap_cache()
+    if cached:
+        return cached["map"]
+
+    # 2) una sola chiamata a AssetPairs, con retry/backoff
+    res = _safe_public(im, "AssetPairs", {})
+    rows = res.get("result") or {}
+    mapping = {}
+    for code, row in rows.items():
+        ws = row.get("wsname")
+        if not ws or "/" not in ws:
+            continue
+        b, q = ws.split("/", 1)
+        b = "BTC" if b.upper() == "XBT" else b.upper()
+        mapping[f"{b}/{q.upper()}"] = code
+
+    if mapping:
+        _save_ap_cache(mapping)
+    return mapping
+
+
+def load_latest(pair: str, base_dir: Optional[str] = None) -> Optional[dict]:
+    """
+    Carica l'ultimo JSON TimesFM per la coppia indicata.
+    - pair: es. "BTC/EUR" (accetta anche "BTC_EUR")
+    - base_dir: cartella che contiene i file .json; se None, usa <repo_root>/storico_output/timesfm
+    Ritorna: dict con chiavi {"meta": {...}, "features": {...}} oppure None se non trovato.
+    """
+    name = (pair or "").replace("/", "_")
+    if not name:
+        return None
+
+    # default coerente con lo writer di TimeSfm
+    search_roots: list[Path] = []
+    if base_dir:
+        search_roots.append(Path(base_dir))
+    # percorso usato dallo script che scrive i file (repo_root/storico_output/timesfm)
+    try:
+        search_roots.append(Path(__file__).resolve().parent.parent / "storico_output" / "timesfm")
+    except Exception:
+        pass
+    # fallback: cwd/storico_output/timesfm (utile in ambienti diversi)
+    try:
+        search_roots.append(Path(os.getcwd()) / "storico_output" / "timesfm")
+    except Exception:
+        pass
+
+    candidates: list[Path] = []
+    for root in search_roots:
+        try:
+            if not root or not root.exists():
+                continue
+            # match esatto
+            f = root / f"{name}.json"
+            if f.exists():
+                candidates.append(f)
+            # eventuali snapshot timestamped tipo BTC_EUR_2025-10-31.json
+            candidates.extend(sorted(root.glob(f"{name}_*.json")))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    # prendi il più recente per mtime
+    best = max(candidates, key=lambda p: p.stat().st_mtime)
+    try:
+        with open(best, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        if isinstance(data, dict):
+            data.setdefault("meta", {})
+            data.setdefault("features", {})
+        return data
+    except Exception:
+        return None
+
+
+def _kr_code_from_assetpairs(im, human: str) -> Optional[str]:
+    mp = _get_assetpairs_map(im)
+    return mp.get(human.upper())
+
+# --- ADD: helper Kraken -> Serie Close giornaliera ---
+# --- fallback Kraken corretto: usa kr-code da AssetPairs, non _normalize_pair ---
+def _kraken_close_series(pair: str, days: int = 5*365) -> Optional[pd.Series]:
+    im = InfoMarket(pair, verbose=False, public_qps=1.6)
+    since = int(time.time()) - int(days * 86400)
+    kr_code = _kr_code_from_assetpairs(im, pair)
+    if not kr_code:
+        # la coppia in EUR non è su Kraken → None (verrà skippata a monte)
+        return None
+    data = _safe_public(im, "OHLC", {"pair": kr_code, "interval": 1440, "since": since})
+    if data.get("error"):
+        return None
+    rows = data.get("result", {}).get(kr_code) or []
+    if not rows:
+        return None
+    ts  = [int(r[0]) for r in rows]
+    cls = [float(r[4]) for r in rows]
+    idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(None).normalize()
+    s = pd.Series(cls, index=idx).sort_index()
+    return s[~s.index.duplicated(keep="last")]
+
+# --- ADD: downloader con fallback ---
+def _download_close(PAIR: str, SYM: str) -> pd.Series:
+    # 1) tentativo Yahoo
+    try:
+        df = yf.download(SYM, period="5y", interval="1d", auto_adjust=True, group_by="ticker", progress=False)
+        s = _get_close(df, SYM).dropna().astype(float)
+        if len(s) >= 16:
+            return s
+    except Exception:
+        pass
+    # 2) fallback Kraken
+    s = _kraken_close_series(PAIR)
+    if s is None or len(s) < 16:
+        # segnala a chi chiama che questa pair va skippata
+        raise RuntimeError(f"SKIP {PAIR}: non disponibile su Yahoo/Kraken")
+    return s
 # =============== util ===============
 def _finite(x) -> bool:
     a = np.asarray(x, dtype=float)
@@ -137,17 +321,18 @@ def main(pairInput, symInput):
     PAIR = pairInput
     SYM  = symInput
     H    = 7
-    CTX  = 1024  # 2048 va bene, ma 1024 è più stabile su alcune CPU
+    CTX  = 2048  # 2048 va bene, ma 1024 è più stabile su alcune CPU
 
     # 1) dati
-    df = yf.download(SYM, period="5y", interval="1d", auto_adjust=True, group_by="ticker")
-    close = _get_close(df, SYM).dropna().astype(float)
+    # df = yf.download(SYM, period="5y", interval="1d", auto_adjust=True, group_by="ticker")
+    # close = _get_close(df, SYM).dropna().astype(float)
+    close = _download_close(PAIR, SYM)
     if len(close) < 16:
         raise ValueError("Serie troppo corta per TimesFM (>=16 punti).")
 
     ctx = close.values[-CTX:] if len(close) > CTX else close.values
-    last = float(ctx[-1])
-
+    # last = float(ctx[-1])
+    last  = float(close.values[-1])
     # 2) forecast (robusto)
     p50, qmat = _run_timesfm_all(ctx, horizon=H, ctx_len=CTX)  # qmat: [p10,p50,p90]
     p10 = qmat[:, 0]; p90 = qmat[:, 2]
@@ -225,5 +410,6 @@ if __name__ == "__main__":
     for pair in pairs:
         try:
             main(pair["pair"], pair["pair"].replace("/", "-"))
-        except Exception:
+        except Exception as e:
+            print(e)
             continue

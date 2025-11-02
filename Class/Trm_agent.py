@@ -291,6 +291,16 @@ class AutoFeaturizer:
         for k, v in (strategy_weights or {}).items():
             self._add(vec, f"w.{k}", self._num(v))
 
+        fc = ((row.get("info") or {}).get("FORECAST") or {})
+        try:
+            e = float(fc.get("timesfm_edge_1d") or 0.0)
+            u = float(fc.get("timesfm_uncert_1d") or 0.0)
+            conf = abs(e) / max(u, 1e-6)
+            self._add(vec, "derived.timesfm_conf:num", float(max(0.0, min(1.0, conf))))
+            self._add(vec, "derived.timesfm_dir:num",  1.0 if e>0 else (-1.0 if e<0 else 0.0))
+        except Exception:
+            pass
+
         # -------- 4) goal_state --------
         if isinstance(goal_state, dict):
             for k, v in goal_state.items():
@@ -530,6 +540,16 @@ class TinyRecursiveModel(nn.Module):
             max_qfrac = float(aux.get("max_quote_frac", [0.12])[i] if isinstance(aux.get("max_quote_frac"), list) else aux.get("max_quote_frac", 0.12))
             min_notional = float(aux.get("min_notional_eur", [5.0])[i] if isinstance(aux.get("min_notional_eur"), list) else aux.get("min_notional_eur", 5.0))
 
+            # --- leggi hints ---
+            tp_hint = float((aux.get("tp_mult_hint") or [0.0])[i])
+            sl_hint = float((aux.get("sl_mult_hint") or [0.0])[i])
+            sh      = float((aux.get("side_hint") or [0.0])[i])
+            tfs     = float((aux.get("timesfm_sig") or [0.0])[i])
+            # 2) TP/SL: blend predizione rete con hint (peso da conf)
+            hint_weight = min(1.0, max(0.0, abs(tfs)))  # usa il segnale timesfm come proxy conf
+            tp_eff = float(tp_mult[i].item()) * 0.5 + tp_hint * 0.5 * hint_weight
+            sl_eff = float(sl_mult[i].item()) * 0.5 + sl_hint * 0.5 * hint_weight
+
             side_idx = int(torch.argmax(p_side[i]).item())   # 0=buy, 1=sell, 2=hold
             p_hat = float(p_side[i, side_idx].item())
             H = float((-(p_side[i] * torch.log(p_side[i] + 1e-12)).sum()).item())  # entropia
@@ -551,8 +571,9 @@ class TinyRecursiveModel(nn.Module):
                 ))
             else:
                 # TP/SL direzionati
-                tp = px * (1.0 + (float(tp_mult[i].item()) if is_buy else -float(tp_mult[i].item())))
-                sl = px * (1.0 - (float(sl_mult[i].item()) if is_buy else -float(sl_mult[i].item())))
+                # poi usa tp_eff/sl_eff invece di tp_mult[i]/sl_mult[i] nella costruzione dei livelli:
+                tp = px * (1.0 + (tp_eff if is_buy else -tp_eff))
+                sl = px * (1.0 - (sl_eff if is_buy else -sl_eff))
                 tp = round(tp, pair_dec); sl = round(sl, pair_dec)
 
                 # size & vincoli (BUDGET-AWARE ma minimale: preserva il resto)
@@ -945,7 +966,46 @@ class TRMAgent:
             mem_list.append(self.memory.memory_feats_for(pair))
         run_aux["mem"] = mem_list
         X, aux = featurize_batch(rows, blends, goal_state, strategy_weights, run_aux=run_aux)
+        # Trm_agent.py → dentro propose_actions_for_batch(...), dopo featurize_batch
+        # --- NEW: cap per-pair guidato da TimesFM (se presente in row.info.FORECAST)
+        cap_list = []
+        # Trm_agent.py (dentro propose_actions_for_batch, dopo cap_list)
+        tp_hints, sl_hints, side_hints, sigs = [], [], [], []
+        for r in rows:
+            fc  = ((r.get("info") or {}).get("FORECAST") or {})
+            fch = ((r.get("info") or {}).get("FORECAST_HINTS") or {})
+            # hints (fallback a None/0.0)
+            tp_hints.append(float(fch.get("tp_mult_hint") or 0.0))
+            sl_hints.append(float(fch.get("sl_mult_hint") or 0.0))
+            side_hints.append(float(fch.get("side_hint") or 0.0))
+            sigs.append(float(fc.get("timesfm_signal") or 0.0))
+
+        # rendili disponibili al decoder (dimensione B)
+        aux["tp_mult_hint"] = tp_hints
+        aux["sl_mult_hint"] = sl_hints
+        aux["side_hint"]    = side_hints
+        aux["timesfm_sig"]  = sigs
         B = len(rows)
+        base_cap = None
+        try:
+            if self.cfg.total_budget_quote is not None and self.cfg.run_currencies_left:
+                base_cap = float(self.cfg.total_budget_quote) * max(0.0, 1.0 - float(self.cfg.reserve_frac))
+                base_cap = base_cap / float(max(1, int(self.cfg.run_currencies_left)))
+        except Exception:
+            base_cap = None
+
+        for r in rows:
+            fc = ((r.get("info") or {}).get("FORECAST") or {})
+            e = float(fc.get("timesfm_edge_1d") or 0.0)
+            u = float(fc.get("timesfm_uncert_1d") or 0.0)
+            # conf semplice: edge / uncert (clippato 0..1)
+            conf = max(0.0, min(1.0, abs(e) / max(u, 1e-6)))
+            # 50%..100% del cap equal-share, proporzionale alla confidenza
+            cap = None if base_cap is None else float(base_cap) * (0.5 + 0.5 * conf)
+            cap_list.append(cap if cap is not None else 0.0)
+
+        if cap_list:
+            aux["cap_eur_hint"] = cap_list  # il decoder lo consumerà per calcolare la qty
         # --- valori dinamici per run (budget/currencies) ---
         if self.cfg.total_budget_quote is not None and B > 0:
             aux["run_budget_quote"]    = [float(self.cfg.total_budget_quote)] * B
@@ -971,6 +1031,12 @@ class TRMAgent:
             rpf = (pf.get("row") or {})
             liq_bid = float(now.get("liquidity_bid_sum") or 0.0)
             liq_ask = float(now.get("liquidity_ask_sum") or 0.0)
+            # dentro loop che riempie pair2input
+            meta = ((row.get("info") or {}).get("FORECAST") or {})
+            pm   = ((row.get("info") or {}).get("FORECAST_META") or ({}))
+            p10_T1 = ((pm.get("p10") or [None])[0] if isinstance(pm.get("p10"), list) else None)
+            p50_T1 = ((pm.get("p50") or [None])[0] if isinstance(pm.get("p50"), list) else None)
+            p90_T1 = ((pm.get("p90") or [None])[0] if isinstance(pm.get("p90"), list) else None)
             inputs = {
                 "now": {
                     "bid": float(now.get("bid") or 0.0),
@@ -996,6 +1062,13 @@ class TRMAgent:
                     "free_base": float((pf.get("available") or {}).get("base") or 0.0),
                     "free_quote": float((pf.get("available") or {}).get("quote") or 0.0),
                 },
+            }
+            inputs["forecast"] = {
+                "edge_1d": meta.get("timesfm_edge_1d"),
+                "uncert_1d": meta.get("timesfm_uncert_1d"),
+                "edge_h": meta.get("timesfm_edge_h"),
+                "uncert_h": meta.get("timesfm_uncert_h"),
+                "p10_T1": p10_T1, "p50_T1": p50_T1, "p90_T1": p90_T1,
             }
             pair = row.get("pair") or f"{row.get('base','?')}/{row.get('quote','?')}"
             pair2input[pair] = {
@@ -1039,6 +1112,14 @@ class TRMAgent:
                     "blend": meta_in["blend"],
                     "weights": {k: float(v) for k, v in (strategy_weights or {}).items()},
                     "goal_state": goal_state or {},
+                }
+
+                # poco prima di self.logger.log(payload)
+                fc  = ((pair2input.get(a.pair, {}).get("inputs", {}) or {}).get("forecast") or {})
+                payload["timesfm"] = {
+                    "edge_1d": fc.get("edge_1d"), "uncert_1d": fc.get("uncert_1d"),
+                    "edge_h": fc.get("edge_h"), "uncert_h": fc.get("uncert_h"),
+                    "p10_T1": fc.get("p10_T1"), "p50_T1": fc.get("p50_T1"), "p90_T1": fc.get("p90_T1"),
                 }
                 # scrivi nel JSONL
                 self.logger.log(payload)

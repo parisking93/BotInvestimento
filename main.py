@@ -250,7 +250,7 @@ ALL_EXEC_REPORTS = []
 
 # 1) Sorgente STREAMING da InfoMarket2
 # istanzia InfoMarket2 in modalità streaming
-im2 = InfoMarket2(per_run=10, total=420, quote="EUR", verbose=True, only_positions=False)
+im2 = InfoMarket2(per_run=10, total=300, quote="EUR", verbose=True, only_positions=False)
 source_aiter = im2.stream_async()   # <--- async iterator di batch da 15 oggetti
 
 from dataclasses import asdict
@@ -346,7 +346,7 @@ async def deliver_fn(item):
     print(f"[deliver_fn#{batch_id}] done — bodies={len(bodies)}")
 
 cfg = PipelineConfig(
-    batch_size=20,
+    batch_size=10,
     max_in_flight_batches=4,
     judge_cfg=StageConfig(concurrency=2, timeout=200, retries=0),
     deliver_cfg=StageConfig(concurrency=2, timeout=90, retries=0),

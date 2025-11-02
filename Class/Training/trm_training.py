@@ -77,7 +77,6 @@ class ShadowActionsDataset(torch.utils.data.Dataset):
                  max_samples: Optional[int] = None):
         self.samples: List[Sample] = []
         assisted_overrides = assisted_overrides or {}
-
         paths: List[str] = []
         if dates:
             for d in dates:
@@ -184,32 +183,26 @@ class ShadowActionsDataset(torch.utils.data.Dataset):
         return self.samples[idx]
 
 class PairedJsonlDataset(torch.utils.data.Dataset):
-    """
-    Ogni riga deve contenere:
-      - 'pair'                      (obbligatorio)
-      - 'inputs' (o 'x_row')        (input su cui si basa l'azione)
-      - 'target' (o 'action')       (azione desiderata: side/qty/price/ordertype/...)
-    Opzionali: 'blend', 'weights', 'goal_state', 'decision_id'.
-    """
-    def __init__(self, path: str, max_samples: int | None = None):
+    def __init__(self, path: str, max_samples: int | None = None, require_executed: bool = False):
         rows = _read_jsonl(path)
         self.samples: List[Sample] = []
         for r in rows:
             pair = r.get("pair") or ((r.get("action") or {}).get("pair"))
             if not pair:
                 continue
-
-            # Costruisci x_row per il featurizer: usa x_row se già fornito, altrimenti converti 'inputs'
-            x_row = r.get("x_row")
-            if not x_row:
-                x_row = _row_from_inputs_block(pair, r.get("inputs") or {})
-
+            x_row = r.get("x_row") or _row_from_inputs_block(pair, r.get("inputs") or {})
             target = (r.get("target") or r.get("action") or {}).copy()
-            # normalizza i minimi
             target["side"] = str(target.get("side") or target.get("tipo") or "hold").lower()
             target["ordertype"] = str(target.get("ordertype") or target.get("quando") or "limit").lower()
             if target["ordertype"] == "hold":
                 target["ordertype"] = "none"
+
+            pnl = r.get("pnl")
+            decision_id = r.get("decision_id")
+            order_id = r.get("order_id") or r.get("orderId")
+            # opzionale: tieni solo esempi con ordine eseguito
+            if require_executed and target["side"] in ("buy","sell") and not order_id:
+                continue
 
             self.samples.append(Sample(
                 x_row=x_row,
@@ -217,8 +210,8 @@ class PairedJsonlDataset(torch.utils.data.Dataset):
                 goal_state=r.get("goal_state") or {},
                 weights=r.get("weights") or {},
                 target=target,
-                pnl=None,
-                decision_id=r.get("decision_id"),
+                pnl=(float(pnl) if pnl is not None else None),
+                decision_id=decision_id,
                 pair=pair
             ))
             if max_samples and len(self.samples) >= max_samples:
@@ -324,6 +317,7 @@ class TRMTrainer:
         self.pnl_scale = float(pnl_scale)
         self.model.to(self.device)
         self.opt = optim.Adam(self.model.parameters(), lr=lr)
+        self.side_class_weights = None
 
         # losses
         self.ce = nn.CrossEntropyLoss(reduction="none")
@@ -334,16 +328,35 @@ class TRMTrainer:
         # memoria
         self.memory = TRMMemory(memory_path)
 
+
+    def _estimate_side_class_weights(self, dataset) -> torch.Tensor:
+        # 0=buy, 1=sell, 2=hold
+        from collections import Counter
+        c = Counter(int(self._targets_from_action({}, s.target)["side"].item()) for s in dataset)
+        total = sum(c.values()) or 1
+        # inversa della frequenza (clippata)
+        w = [total / max(c.get(i,1),1) for i in range(3)]
+        # normalizza
+        s = sum(w); w = [x/s for x in w]
+        return torch.tensor(w, dtype=torch.float32, device=self.device)
+
     # ---------- supervised targets ----------
     def _targets_from_action(self, x_aux: Dict[str, List[Any]], target: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         side_map = {"buy":0, "sell":1, "hold":2}
         side_idx = side_map.get(str(target.get("side","hold")).lower(), 2)
 
         free_quote = float(x_aux.get("free_quote",[0.0])[0] or 0.0)
+        pos_base  = float(x_aux.get("pos_base",[0.0])[0] or 0.0) if "pos_base" in x_aux else float(x_aux.get("pos_margin_base",[0.0])[0] or 0.0)
         price = float(target.get("price") or x_aux.get("mid",[0.0])[0] or 0.0)
         qty = float(target.get("qty") or target.get("quantita") or 0.0)
-        notional = qty * price if (qty and price) else 0.0
-        qty_frac = 0.0 if free_quote <= 0 else min(max(notional / max(free_quote, 1e-9), 0.0), 1.0)
+
+        if side_idx == 0:  # BUY
+            notional = qty * price if (qty and price) else 0.0
+            qty_frac = 0.0 if free_quote <= 0 else min(max(notional / max(free_quote, 1e-9), 0.0), 1.0)
+        elif side_idx == 1:  # SELL
+            qty_frac = 0.0 if pos_base <= 0 else min(max(qty / max(pos_base, 1e-9), 0.0), 1.0)
+        else:
+            qty_frac = 0.0
 
         mid = float(x_aux.get("mid",[0.0])[0] or 0.0)
         px = float(target.get("price") or mid)
@@ -383,22 +396,43 @@ class TRMTrainer:
         }
         return out
 
-    def _loss_supervised(self, heads: Dict[str, torch.Tensor], tgt: Dict[str, torch.Tensor],
-                         reward_w: Optional[torch.Tensor] = None) -> torch.Tensor:
-        ce_side = self.ce(heads["logits_side"], tgt["side"])
+    def _loss_supervised(self, heads, tgt, reward_sig: Optional[torch.Tensor] = None,
+                        class_w: Optional[torch.Tensor] = None,
+                        gate_nonexec: bool = True) -> torch.Tensor:
+        # CE con pesi di classe opzionali
+        ce_fn = nn.CrossEntropyLoss(reduction="none", weight=class_w.to(heads["logits_side"].device) if class_w is not None else None)
+
+        ce_side = ce_fn(heads["logits_side"], tgt["side"])   # imitazione
         ce_ord  = self.ce(heads["ord_logits"], tgt["ordertype"])
         ce_tif  = self.ce(heads["tif_logits"], tgt["tif"])
         l_qty   = self.l1(heads["qty"], tgt["qty_frac"])
         l_px    = self.l1(heads["px"], tgt["px_off"])
         b_reduce= self.bce(heads["reduce_logit"], tgt["reduce"])
 
-        if reward_w is None:
-            loss = (ce_side + 0.5*ce_ord + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce).mean()
-        else:
-            loss = ((reward_w * ce_side) + (0.5 * reward_w * ce_ord) + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce).mean()
-        return loss
+        # gating per HOLD: se hold, non alleni qty/px/reduce
+        if gate_nonexec:
+            is_hold = (tgt["side"] == 2).float() if tgt["side"].dtype == torch.long else (tgt["side"] == torch.tensor([2], device=tgt["side"].device)).float()
+            # keep side/tif/ord sempre, ma disattiva qty/px/reduce
+            l_qty = l_qty * (1.0 - is_hold)
+            l_px  = l_px  * (1.0 - is_hold)
+            b_reduce = b_reduce * (1.0 - is_hold)
 
-    # --- STIMA COSTO DI INGRESSO ---
+        # rinforzo: se reward negativo, aggiungi anti-imitazione (opposto) per la side
+        if reward_sig is not None:
+            r = reward_sig.clamp(-1.0, 1.0)
+            pos = (r.clamp(min=0.0) + 1.0)          # [1,2]
+            neg = (-r).clamp(min=0.0)               # [0,1]
+            # opp label
+            side_opp = tgt["side"].clone()
+            side_opp[:] = self._opp_side_idx(int(tgt["side"].item()))
+            ce_side_opp = ce_fn(heads["logits_side"], side_opp)
+            # loss finale: premia imitazione se r>0; se r<0 aggiungi spinta opposta
+            loss_side = pos * ce_side + 0.5 * neg * ce_side_opp
+        else:
+            loss_side = ce_side
+
+        return (loss_side + 0.5*ce_ord + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce).mean()
+
     def _trade_cost_est(self, x_aux: dict, target: dict) -> torch.Tensor:
         device = self.device
         try:
@@ -406,14 +440,22 @@ class TRMTrainer:
             ask = float((x_aux.get("ask") or [0.0])[0] or 0.0)
             mid = 0.5*(bid+ask) if (bid>0 and ask>0) else max(bid, ask, 0.0)
             spread = (ask - bid) if (ask>0 and bid>0) else 0.0
-            sl_in  = float((x_aux.get("slippage_in")  or [0.0])[0] or 0.0)
+            side = str(target.get("side","hold")).lower()
+            if side == "buy":
+                slip_pct = float((x_aux.get("slippage_buy_pct")  or [0.0])[0] or 0.0)
+            elif side == "sell":
+                slip_pct = float((x_aux.get("slippage_sell_pct") or [0.0])[0] or 0.0)
+            else:
+                slip_pct = 0.0  # hold: niente costo
+
             fee_maker = float((x_aux.get("fee_maker") or [0.001])[0] or 0.001)
             fee_taker = float((x_aux.get("fee_taker") or [0.001])[0] or 0.001)
             ordtype = str(target.get("ordertype","limit")).lower()
             fee_in  = fee_taker if ordtype == "market" else fee_maker
+
             half_spread = 0.5*spread
-            slip = max(sl_in, 0.0)
-            cost_eur = half_spread + slip + fee_in*mid
+            slip_abs = abs(slip_pct) * mid
+            cost_eur = half_spread + slip_abs + fee_in*mid
             return torch.tensor([cost_eur], dtype=torch.float32, device=device)
         except Exception:
             return torch.tensor([0.0], dtype=torch.float32, device=device)
@@ -430,6 +472,21 @@ class TRMTrainer:
             return base * eco
         return base
 
+    # --- helper: indice opposto per side (0=buy, 1=sell, 2=hold) ---
+    def _opp_side_idx(self, idx: int) -> int:
+        if idx == 0: return 1
+        if idx == 1: return 0
+        return 2  # hold resta hold
+
+    def _make_reward_signal(self, pnl_value: Optional[float], cost_est: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # r in [-1, +1] con segno
+        if pnl_value is None:
+            return torch.tensor([0.0], dtype=torch.float32, device=self.device)
+        k = float(self.pnl_scale)
+        pnl = torch.tensor([float(pnl_value)], dtype=torch.float32, device=self.device).clamp(-10.0, 10.0)
+        edge = pnl - (cost_est.to(self.device).float() if cost_est is not None else 0.0)
+        return torch.tanh(k * edge)  # <-- mantiene il segno
+
     # ---------- training loop ----------
     def train_epoch(self,
                     dataset: ShadowActionsDataset,
@@ -438,6 +495,9 @@ class TRMTrainer:
         """
         Un'epoca di training. 'mode' in {'supervised','reinforce_like','assisted'}.
         """
+        if self.side_class_weights is None:
+            self.side_class_weights = self._estimate_side_class_weights(dataset)
+
         self.model.train()
         dl = torch.utils.data.DataLoader(
             dataset, batch_size=1, shuffle=True,
@@ -467,11 +527,15 @@ class TRMTrainer:
 
             reward_w = None
             m = mode.lower()
-            if m == "reinforce_like":
-                cost_est = self._trade_cost_est(aux, s.target)
-                reward_w = self._make_reward_weight(s.pnl, cost_est)
+            # if m == "reinforce_like":
+            #     cost_est = self._trade_cost_est(aux, s.target)
+            #     reward_w = self._make_reward_signal(s.pnl, cost_est)
 
-            loss = self._loss_supervised(h, tgt, reward_w=reward_w)
+            reward_sig = None
+            if mode.lower() == "reinforce_like":
+                cost_est = self._trade_cost_est(aux, s.target)
+                reward_sig = self._make_reward_signal(s.pnl, cost_est)
+            loss = self._loss_supervised(h, tgt, reward_sig=reward_sig, class_w=self.side_class_weights)
 
             self.opt.zero_grad()
             loss.backward()
@@ -506,7 +570,7 @@ class TRMTrainer:
             yK = self.model.improve(Xn, y0=y0, K=self.agent.cfg.K_refine)
             h = self._forward_heads(yK)
             tgt = self._targets_from_action(aux, s.target)
-            loss = self._loss_supervised(h, tgt, reward_w=None)
+            loss = self._loss_supervised(h, tgt, reward_sig=None)
             tot += float(loss.item()); n += 1
         return {"loss": tot / max(n,1)}
 
@@ -646,6 +710,8 @@ if __name__ == "__main__":
     parser.add_argument("--memory_overrides", type=str, default=None)
     parser.add_argument("--hold_max_frac", type=float, default=0.6)
     parser.add_argument("--early_stop_patience", type=int, default=3)
+    parser.add_argument("--mode", type=str, default="reinforce_like",
+                    choices=["supervised","reinforce_like","assisted"])
     args = parser.parse_args()
 
     # --- SEED ---
@@ -672,6 +738,7 @@ if __name__ == "__main__":
             overrides.update(load_manual_overrides(args.manual_overrides))
         if args.memory_overrides:
             overrides.update(load_manual_overrides(args.memory_overrides))
+        print(f'ciao {agent.cfg.log_path}')
         full_ds = ShadowActionsDataset(log_base_path=agent.cfg.log_path, assisted_overrides=(overrides or None))
         print(f"[dataset] shadow samples: {len(full_ds)}")
 
@@ -745,3 +812,4 @@ if __name__ == "__main__":
 # run on root
 
 # python -m Class.Training.trm_training --paired_file ".\storico_output\trm_log\training\test.jsonl" --device cpu --epochs 8 --batch_size 32 --save ".\aiConfig\trm_from_paired.ckpt"
+# python -m Class.Training.trm_training --paired_file "\storico_output\trm_log\training\trm_paired_dataset_20251030_192606.jsonl" --device cpu --epochs 8 --batch_size 32 --lr 1e-3 --val_frac 0.2 --save ".\aiConfig\trm_from_paired.ckpt"

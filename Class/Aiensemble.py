@@ -3159,7 +3159,74 @@ class AIEnsembleTrader:
             print(f"[AIEnsemble.log_execution_to_shadow] errore: {e}")
 
 
+    # # Aiensemble.py (nella classe AIEnsembleTrader)
+    # def _inject_timesfm_features(self, rows: list[dict]) -> None:
+    #     """
+    #     Se esiste un file ./storico_output/timesfm/<PAIR>.json lo carica e
+    #     inietta: info.FORECAST.* e un segnale opzionale in blend.timesfm.
+    #     """
+    #     try:
+    #         from TimeSfm import load_latest
+    #     except Exception:
+    #         return
 
+    #     base = os.path.join(self.output_dir or ".", "timesfm")  # stessa cartella degli output
+    #     for r in rows:
+    #         pair = r.get("pair") or f"{r.get('base','?')}/{r.get('quote','?')}"
+    #         j = load_latest(pair, base_dir=base)
+    #         if not j:
+    #             continue
+    #         feats = (j.get("features") or {})
+    #         # 1) come blocco info → verrà “flattenato” in feature hash (info.FORECAST.*)
+    #         r.setdefault("info", {}).setdefault("FORECAST", {}).update(feats)
+    #         # 2) opzionale: segnale diretto nel blend
+    #         sig = feats.get("timesfm_signal", None)
+    #         if sig is not None:
+    #             r.setdefault("meta", {}).setdefault("signals_extra", {})["TimesFM"] = float(sig)
+
+    # Aiensemble.py
+    def _inject_timesfm_features(self, rows: list[dict]) -> None:
+        try:
+            from .TimeSfm import load_latest
+        except Exception as e:
+            print(e)
+            return
+        base = os.path.join(self.output_dir or ".", "timesfm")  # stessa cartella degli output
+        for r in rows:
+            pair = r.get("pair") or f"{r.get('base','?')}/{r.get('quote','?')}"
+            j = load_latest(pair, base_dir=base)
+            if not j:
+                continue
+
+            feats = (j.get("features") or {})
+            r.setdefault("info", {}).setdefault("FORECAST", {}).update(feats)
+
+
+            # === NEW: hints dai quantili ===
+            meta = j.get("meta") or {}
+            r["info"]["FORECAST_META"] = meta  # <— nuovo allineamento
+            try:
+                last = float(meta.get("last_price") or 0.0)
+                p10  = float((meta.get("p10") or [None])[0] or 0.0)
+                p50  = float((meta.get("p50") or [None])[0] or 0.0)
+                p90  = float((meta.get("p90") or [None])[0] or 0.0)
+                up   = (p90 - last) / max(last, 1e-12)
+                dn   = (p10 - last) / max(last, 1e-12)
+                side_hint = (1.0 if p50 > last else (-1.0 if p50 < last else 0.0))
+                conf_hint = abs(float(feats.get("timesfm_edge_1d") or 0.0)) / max(float(feats.get("timesfm_uncert_1d") or 0.0), 1e-6)
+                r["info"].setdefault("FORECAST_HINTS", {}).update({
+                    "tp_mult_hint": max(0.0, up),
+                    "sl_mult_hint": max(0.0, -dn),
+                    "side_hint": side_hint,
+                    "conf_hint": float(max(0.0, min(1.0, conf_hint))),
+                })
+            except Exception:
+                pass
+
+            # (già presente) opzionale: spinge un segnale nel blend
+            sig = feats.get("timesfm_signal", None)
+            if sig is not None:
+                r.setdefault("meta", {}).setdefault("signals_extra", {})["TimesFM"] = float(sig)
 
     # -------------------- signals/blend --------------------
 
@@ -4140,12 +4207,18 @@ class AIEnsembleTrader:
         }
 
     def _collect_trm_batch(self):
-        """
-        Costruisce i 4 blocchi che il TRM si aspetta:
-        rows, blends (uno per row), goal_state (comune), strategy_weights (comuni).
-        """
         rows = list(self._currencies or [])
+        # NEW: inietta features TimesFM se presenti su disco
+        self._inject_timesfm_features(rows)
+
         blends = [self._build_blend_vector_for_row(r) for r in rows]
+
+        # NEW: se hai messo un segnale extra in meta, aggiungilo al dict blend.*
+        for i, r in enumerate(rows):
+            xtra = ((r.get("meta") or {}).get("signals_extra") or {})
+            val = xtra.get("TimesFM")
+            if val is not None:
+                blends[i]["timesfm"] = float(val)  # apparirà come feature blend.timesfm
         goal_state = self._goal_state_for_trm()
         strategy_weights = self._strategy_weights_for_trm()
         return rows, blends, goal_state, strategy_weights
