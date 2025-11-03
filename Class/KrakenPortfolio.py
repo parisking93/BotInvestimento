@@ -226,7 +226,10 @@ class KrakenPortfolio:
 
 
     # ----------------- trades history (con cache) -----------------
-    def trades_history(self, start=None, ofs=0, max_loops=40) -> list:
+    def trades_history(self, start=None, ofs=0, max_loops=40, since_hours: int | None = None) -> list:
+        if since_hours is not None and start is None:
+            start = int(time.time() - since_hours * 3600)
+
         cache_key = ("trades", start, ofs)
         cached = self._cache.get(cache_key, self._trades_ttl)
         if cached is not None:
@@ -235,14 +238,14 @@ class KrakenPortfolio:
         all_trades, loops = [], 0
         payload = {"type": "all"}
         if start is not None:
-            payload["start"] = start
+            payload["start"] = int(start)
 
         while loops < max_loops:
             resp = self._kraken_call(
                 "TradesHistory",
                 {**payload, "ofs": ofs},
                 private=True,
-                weight=3.0,
+                weight=1.2,                   # <--- era 3.0
             )
             trades = resp["result"].get("trades", {}) or {}
             if not trades:
@@ -259,13 +262,15 @@ class KrakenPortfolio:
         return all_trades
 
     # ----------------- ledgers (con cache) -----------------
-    def ledgers(self) -> dict:
-        cached = self._cache.get(("ledgers",), self._ledgers_ttl)
+    def ledgers(self, start: int | None = None) -> dict:
+        cache_key = ("ledgers", start)
+        cached = self._cache.get(cache_key, self._ledgers_ttl)
         if cached is not None:
             return cached
-        resp = self._kraken_call("Ledgers", private=True, weight=3.0)
+        params = {"start": int(start)} if start is not None else {}
+        resp = self._kraken_call("Ledgers", params, private=True, weight=1.2)  # <--- era 3.0
         out = resp["result"].get("ledger", {}) or {}
-        self._cache.set(("ledgers",), out)
+        self._cache.set(cache_key, out)
         return out
 
     # ----------------- util per interpretare i pair nei trade -----------------
@@ -388,54 +393,28 @@ class KrakenPortfolio:
         return merged
 
     # ----------------- vista portafoglio -----------------
-    def portfolio_view(self, include_diagnostics: bool = True):
-        """
-        Ritorna (rows, total_eur, trades, ledgers).
-        Di default NON scarica trades/ledgers (pesanti): abilita con include_diagnostics=True.
-        """
+    def portfolio_view(self, include_diagnostics: bool = False, diag_hours: int = 72):
         self.bals = self.balances(self._balances_ttl)
-
-        avg_costs = {}
-        # if include_diagnostics:
-        #     # calcoli cost basis solo quando servono
-        #     avg_costs_tr = self.average_costs_from_trades()
-        #     avg_costs_ld = self.average_costs_from_ledgers()
-        #     avg_costs = {
-        #         a: (avg_costs_tr.get(a) if avg_costs_tr.get(a) is not None else avg_costs_ld.get(a))
-        #         for a in set(list(avg_costs_tr.keys()) + list(avg_costs_ld.keys()) + list(self.bals.keys()))
-        #     }
-
+        include_diagnostics = True
         rows = []
         total_eur = 0.0
-
         for code, qty in self.bals.items():
             alt = self.assets_info.get(code, {}).get("altname", code)
             px = self.price_in_eur(code)
             val = qty * px if (px is not None and not math.isnan(px)) else None
-
-            # avg_buy = avg_costs.get(code) if include_diagnostics else None
-            pnl_pct = None
-            # if include_diagnostics and avg_buy not in (None, 0) and px is not None and not math.isnan(px):
-            #     pnl_pct = (px - avg_buy) / avg_buy
-
             if val is not None:
                 total_eur += val
-
-            rows.append(
-                {
-                    "code": code,
-                    "asset": alt,
-                    "qty": qty,
-                    "px_EUR": px,
-                    "val_EUR": val,
-                    "avg_buy_EUR": None,
-                    "pnl_pct": None,
-                }
-            )
-
+            rows.append({"code": code, "asset": alt, "qty": qty, "px_EUR": px, "val_EUR": val,
+                        "avg_buy_EUR": None, "pnl_pct": None})
         rows.sort(key=lambda r: (r["val_EUR"] or 0), reverse=True)
-        trades = self.trades_history() if include_diagnostics else []
-        ledgers = self.ledgers() if include_diagnostics else {}
+
+        if include_diagnostics:
+            start_ts = int(time.time() - diag_hours * 3600)
+            trades  = self.trades_history(start=start_ts)       # o: since_hours=diag_hours
+            ledgers = self.ledgers(start=start_ts)
+        else:
+            trades, ledgers = [], {}
+
         return rows, total_eur, trades, ledgers, self.pairs_info
 
     # ----------------- EUR investibili -----------------

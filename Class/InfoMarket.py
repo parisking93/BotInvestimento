@@ -972,8 +972,8 @@ class InfoMarket2:
         salva in attributi: rows/total/trades/ledgers.
         """
         print("\n========== KrakenPortfolio: portafoglio ==========")
-        kp = KrakenPortfolio()
-        rows, total, trades, ledgers, AssetPair = kp.portfolio_view()
+        self.kp = KrakenPortfolio()
+        rows, total, trades, ledgers, AssetPair = self.kp.portfolio_view()
 
         # salva negli attributi
         self.portfolio_rows = rows
@@ -988,14 +988,14 @@ class InfoMarket2:
 
         # --- NEW: leggi anche OpenOrders / OpenPositions dal client krakenex di KrakenPortfolio
         try:
-            resp_oo = kp.k.query_private('OpenOrders') or {}
+            resp_oo = self.kp.k.query_private('OpenOrders') or {}
             open_orders = (resp_oo.get('result') or {}).get('open', {}) or {}
         except Exception:
             open_orders = {}
 
-        self.portfolioIn = kp.investable_eur(resp_oo)
+        self.portfolioIn = self.kp.investable_eur(resp_oo)
         try:
-            resp_pos = kp.k.query_private('OpenPositions') or {}
+            resp_pos = self.kp.k.query_private('OpenPositions') or {}
             open_positions = (resp_pos.get('result') or {}) or {}
         except Exception:
             open_positions = {}
@@ -1216,11 +1216,11 @@ class InfoMarket2:
     # ------------------- export accurato ---------------------
     def _export_block(self, kr_list: List[str]) -> List[dict]:
         # Mappa kr->human (serve anche per derive base/quote)
-        ap = self._rest._public("AssetPairs")
-        if ap.get("error"):
-            if self.verbose:
-                print(f"[InfoMarket2] skip invalid pairs in AssetPairs: {ap['error']}")
-        ap_map = ap.get("result", {}) or {}
+        # ap = self._rest._public("AssetPairs")
+        # if ap.get("error"):
+        #     if self.verbose:
+        #         print(f"[InfoMarket2] skip invalid pairs in AssetPairs: {ap['error']}")
+        ap_map = self.AssetPair or {}
 
         def _kr_to_human_local(kr: str) -> str:
             h = self._kr_to_human.get(kr)

@@ -20,9 +20,12 @@ from pathlib import Path
 import shutil
 # --- ADD: in cima ai import ---
 try:
-    from .InfoMarket import InfoMarket
+    from InfoMarket import InfoMarket
 except Exception:
-    from Class.InfoMarket import InfoMarket
+    try:
+        from .InfoMarket import InfoMarket
+    except Exception:
+        from Class.InfoMarket import InfoMarket
 
 import pandas as pd
 import time

@@ -200,7 +200,7 @@ def reconcile_shadow_with_query_orders(log_path: str, kraken, sleep_s: float = 0
             rows[i] = rec
 
     if updated:
-        _jsonl_write_all_atomic(log_path, rows)
+        _jsonl_write_all_atomic(daily_log_path, rows)
     return updated
 
 

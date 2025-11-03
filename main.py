@@ -250,7 +250,7 @@ ALL_EXEC_REPORTS = []
 
 # 1) Sorgente STREAMING da InfoMarket2
 # istanzia InfoMarket2 in modalità streaming
-im2 = InfoMarket2(per_run=10, total=300, quote="EUR", verbose=True, only_positions=False)
+im2 = InfoMarket2(per_run=5, total=100, quote="EUR", verbose=True, only_positions=False)
 source_aiter = im2.stream_async()   # <--- async iterator di batch da 15 oggetti
 
 from dataclasses import asdict
@@ -309,7 +309,7 @@ async def deliver_fn(item):
     # print(res_ai["scores"])
 
     runner = KrakenOrderRunner(pair_map={s: s for s in symbols})
-    bodies = runner.build_bodies(actions, validate=True, auto_brackets=False)
+    bodies = runner.build_bodies(actions, validate=False, auto_brackets=False)
     test = runner.execute_bodies(bodies, timeout=0.8)
 
 
@@ -331,7 +331,7 @@ async def deliver_fn(item):
     print('bodies')
 
     for acts in actions:
-        print(acts)
+        print(acts) if acts.get('tipo') != 'hold' else print(f"pair: {acts.get('pair')}, side: {acts.get('side')}")
 
     print('teswt')
 
@@ -346,7 +346,7 @@ async def deliver_fn(item):
     print(f"[deliver_fn#{batch_id}] done — bodies={len(bodies)}")
 
 cfg = PipelineConfig(
-    batch_size=10,
+    batch_size=5,
     max_in_flight_batches=4,
     judge_cfg=StageConfig(concurrency=2, timeout=200, retries=0),
     deliver_cfg=StageConfig(concurrency=2, timeout=90, retries=0),

@@ -100,6 +100,8 @@ class DailyMemory:
     def __init__(self):
         self.by_pair = {}
         self.counts = {}
+        self.no_trade = set()   # es: "Invalid permissions:* for IT"
+        self.no_margin = set()  # es: "Margin trading in asset is restricted"
 
     @staticmethod
     def _today_path(base_dir: str) -> str:
@@ -132,15 +134,26 @@ class DailyMemory:
                 px   = act.get("price")
                 sc   = act.get("score")
                 ts   = rec.get("ts") or rec.get("timestamp")
+
                 if not pair:
                     continue
                 # aggiorna ultimo
                 self.by_pair[pair] = {"last_side": side, "last_price": px, "last_score": sc, "last_ts": ts, "last_entry_price": act.get("prezzo") or act.get("price"), "last_take_profit": act.get("take_profit") or act.get("tp")}
+                # self.by_pair[pair]["tp_hit_now"] = rec.get("tp_hit_now") or d.get("tp_hit_now")
                 # conteggi
                 c = self.counts.get(pair, {"buy":0, "sell":0, "hold":0})
                 if side in c:
                     c[side] += 1
                 self.counts[pair] = c
+                try:
+                    err = ((act.get("after") or {}).get("kraken_result") or {}).get('error')
+                except Exception:
+                    err = ''
+                em = err if err else ''
+                if "EAccount:Invalid permissions" in em:
+                    self.no_trade.add(pair)
+                if "EOrder:Margin trading in asset is restricted" in em and "restricted" in em:
+                    self.no_margin.add(pair)
 
     def memory_feats_for(self, pair: str) -> dict:
         info = self.by_pair.get(pair, {})
@@ -418,9 +431,9 @@ class Action:
 @dataclass
 class TRMConfig:
     feature_dim: int = 128
-    hidden_dim: int = 128
-    mlp_hidden: int = 256
-    K_refine: int = 5
+    hidden_dim: int = 64
+    mlp_hidden: int = 128
+    K_refine: int = 4
     max_actions_per_pair: int = 2
     norm_eps: float = 1e-6
     log_path: Optional[str] = None
@@ -981,6 +994,7 @@ class TRMAgent:
             sigs.append(float(fc.get("timesfm_signal") or 0.0))
 
         # rendili disponibili al decoder (dimensione B)
+        aux = dict(aux or {})
         aux["tp_mult_hint"] = tp_hints
         aux["sl_mult_hint"] = sl_hints
         aux["side_hint"]    = side_hints
