@@ -343,23 +343,29 @@ class TRMTrainer:
             max_qf = 0.12
         return torch.relu(qf - max_qf)
 
-    def _market_regularizer(self, heads: Dict[str, torch.Tensor], x_aux: Dict[str, List[Any]]) -> torch.Tensor:
-        """
-        Penalità = p_market * costo_relativo.
-        p_market è la prob softmax della classe 'market' nelle head di ordertype.
-        costo_relativo ~ cost_eur / mid (proxy in bps/percent).
-        """
-        ord_logits = heads["ord_logits"]          # [B,2]
+    def _market_regularizer(self, heads, x_aux):
+        ord_logits = heads["ord_logits"]                 # [B,2]
         p_market = torch.softmax(ord_logits, dim=-1)[:, 1]  # [B]
-        # costo atteso (eur) usando buy come proxy (va bene anche per sell come ordine indicativo)
-        fake_tgt = {"ordertype": "market", "side": "buy"}
-        cost_eur = self._trade_cost_est(x_aux, fake_tgt).to(p_market.device).view(-1)  # [B]
+
+        # costo atteso (EUR)
+        cost_eur = self._trade_cost_est(x_aux, {"ordertype": "market", "side": "buy"}).to(p_market.device).view(-1)
+
+        # recupero mid da aux con fallback e guardie
+        mid_val = x_aux.get("mid") or x_aux.get("vwap") or x_aux.get("price_now")
+        if isinstance(mid_val, list):
+            mid_val = (mid_val[0] if len(mid_val) > 0 else 0.0)
         try:
-            mid = float((x_aux.get("mid") or [0.0])[0] or 0.0)
+            mid = float(mid_val or 0.0)
         except Exception:
             mid = 0.0
-        rel_cost = (cost_eur / max(mid, 1e-6)) if mid > 0 else cost_eur  # se mid manca, usa assoluto
-        return p_market * rel_cost
+
+        # se non ho mid>0, NON penalizzo
+        if not (mid > 0):
+            return torch.zeros_like(p_market)
+
+        # costo relativo con cap (2%)
+        rel = torch.clamp(cost_eur / max(mid, 1e-6), min=0.0, max=0.02)
+        return p_market * rel
 
     def _cycle_hinge(self, pnl_value: Optional[float], x_aux: Dict[str, List[Any]],
                     heads: Dict[str, torch.Tensor], tgt: Dict[str, torch.Tensor],
@@ -402,7 +408,7 @@ class TRMTrainer:
         side_idx = side_map.get(str(target.get("side","hold")).lower(), 2)
 
         free_quote = float(x_aux.get("free_quote",[0.0])[0] or 0.0)
-        pos_base  = float(x_aux.get("pos_base",[0.0])[0] or 0.0) if "pos_base" in x_aux else float(x_aux.get("pos_margin_base",[0.0])[0] or 0.0)
+        pos_base  = float((x_aux.get("pos_base") or [0.0])[0])
         price = float(target.get("price") or x_aux.get("mid",[0.0])[0] or 0.0)
         qty = float(target.get("qty") or target.get("quantita") or 0.0)
 
@@ -449,6 +455,7 @@ class TRMTrainer:
             "ord_logits": m.head_ordertype(y),
             "tif_logits": m.head_tif(y),
             "reduce_logit": m.head_reduce(y).squeeze(-1),
+            "halt_logit": m.head_halt(y).squeeze(-1)
         }
         return out
 
@@ -464,7 +471,14 @@ class TRMTrainer:
         l_qty   = self.l1(heads["qty"], tgt["qty_frac"])
         l_px    = self.l1(heads["px"], tgt["px_off"])
         b_reduce= self.bce(heads["reduce_logit"], tgt["reduce"])
-
+     # ---- self-distilled halt target: conf = (1 - H_norm) * (1 - P(hold)) ----
+        with torch.no_grad():
+            p_side = torch.softmax(heads["logits_side"], dim=-1)
+            H = (-(p_side * torch.log(p_side + 1e-12)).sum(dim=-1))               # entropia
+            Hn = H / math.log(3.0)
+            conf = (1.0 - Hn) * (1.0 - p_side[:, 2])                               # 2 = hold
+            conf = conf.clamp(0.0, 1.0)
+        b_halt = self.bce(heads["halt_logit"], conf)
         # gating per HOLD: se hold, non alleni qty/px/reduce
         if gate_nonexec:
             is_hold = (tgt["side"] == 2).float() if tgt["side"].dtype == torch.long else (tgt["side"] == torch.tensor([2], device=tgt["side"].device)).float()
@@ -497,9 +511,9 @@ class TRMTrainer:
                 return (loss_side + 0.5*ce_ord + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce
                         + lam_budget*loss_budget.mean()
                         + lam_market*loss_market.mean()
-                        + lam_cycle*loss_cycle.mean()).mean()
+                        + lam_cycle*loss_cycle.mean() + 0.05*b_halt).mean()
 
-        return (loss_side + 0.5*ce_ord + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce).mean()
+        return (loss_side + 0.5*ce_ord + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce + 0.05*b_halt).mean()
 
     def _trade_cost_est(self, x_aux: dict, target: dict) -> torch.Tensor:
         device = self.device
@@ -587,8 +601,21 @@ class TRMTrainer:
             X = X.to(self.device)
             self.model.norm.update(X)
             Xn = self.model.norm(X)
-            y0 = self.model.y0_proj(Xn)                  # y0 learnable, NO random
-            yK = self.model.improve(X, y0=y0, K=self.agent.cfg.K_refine)  # passa X (raw), non Xn
+            y0 = self.model.y0_proj(Xn).detach()
+            if getattr(self.agent.cfg, "act_enabled", False):
+                # allineato a propose_actions_for_batch (runtime)
+                print('dentro')
+                yK, _ = self.model.improve_adaptive(
+                    X, y0=y0,
+                    max_steps=int(self.agent.cfg.K_refine),
+                    min_steps=int(getattr(self.agent.cfg, "act_min_steps", 1)),
+                    threshold=float(getattr(self.agent.cfg, "act_threshold", 0.60)),
+                    return_stats=True,
+                )
+                yK = yK.detach().clone()
+            else:
+                yK = self.model.improve(X, y0=y0, K=self.agent.cfg.K_refine)                 # y0 learnable, NO random
+            # yK = self.model.improve(X, y0=y0, K=self.agent.cfg.K_refine)  # passa X (raw), non Xn   u should use improve_adaptive
             h = self._forward_heads(yK)
             tgt = self._targets_from_action(aux, s.target)
 
@@ -596,8 +623,9 @@ class TRMTrainer:
             pen_budget = self._budget_penalty(h, aux)
             pen_market = self._market_regularizer(h, aux)
             cycle_h    = self._cycle_hinge(s.pnl, aux, h, tgt, margin=0.0)  # margin 0 = “almeno non perdere”
-            # esponi al calcolo della loss
+            # # esponi al calcolo della loss
             self._extra_terms = (pen_budget, pen_market, cycle_h)
+            # self._extra_terms = None
 
             reward_w = None
             m = mode.lower()
@@ -635,13 +663,24 @@ class TRMTrainer:
                 "run_currencies_left": self.cfg.run_currencies_left or 200,
                 "mem": [ self.agent.memory.memory_feats_for(s.pair) ]  # un solo sample nel batch
             }
-            print(run_aux)
-            print(s.pair)
+            # print(run_aux)
+            # print(s.pair)
             X, aux = featurize_batch([s.x_row], [s.blend], s.goal_state, s.weights, run_aux=run_aux)
             X = X.to(self.device)
             Xn = self.model.norm(X)
-            y0 = self.model.y0_proj(Xn)                  # y0 learnable, NO random
-            yK = self.model.improve(X, y0=y0, K=self.agent.cfg.K_refine)
+            y0 = self.model.y0_proj(Xn).detach()                  # y0 learnable, NO random
+
+            if getattr(self.agent.cfg, "act_enabled", False):
+                yK, _ = self.model.improve_adaptive(
+                    X, y0=y0,
+                    max_steps=int(self.agent.cfg.K_refine),
+                    min_steps=int(getattr(self.agent.cfg, "act_min_steps", 1)),
+                    threshold=float(getattr(self.agent.cfg, "act_threshold", 0.60)),
+                    return_stats=True,
+                )
+                yK = yK.detach().clone()
+            else:
+                yK = self.model.improve(X, y0=y0, K=self.agent.cfg.K_refine)
             h = self._forward_heads(yK)
             tgt = self._targets_from_action(aux, s.target)
             pen_budget = self._budget_penalty(h, aux)
@@ -649,7 +688,8 @@ class TRMTrainer:
             cycle_h    = self._cycle_hinge(s.pnl, aux, h, tgt, margin=0.0)  # margin 0 = “almeno non perdere”
             # esponi al calcolo della loss
             self._extra_terms = (pen_budget, pen_market, cycle_h)
-            loss = self._loss_supervised(h, tgt, reward_sig=None)
+            # self._extra_terms = None
+            loss = self._loss_supervised(h, tgt, reward_sig=None, class_w=self.side_class_weights)
             self._extra_terms = None
             tot += float(loss.item()); n += 1
         return {"loss": tot / max(n,1)}
@@ -860,7 +900,7 @@ if __name__ == "__main__":
     min_epochs = 3
 
     for epoch in range(1, args.epochs + 1):
-        loss_tr = trainer.train_epoch(dataset=train_ds, mode="supervised", batch_size=args.batch_size)
+        loss_tr = trainer.train_epoch(dataset=train_ds, mode=args.mode, batch_size=args.batch_size)
         metrics_val = trainer.evaluate(dataset=val_ds)
         loss_val = metrics_val["loss"]
         print(f"[epoch {epoch:02d}] train_loss={loss_tr:.5f} | val_loss={loss_val:.5f}")
@@ -892,4 +932,6 @@ if __name__ == "__main__":
 # run on root
 
 # python -m Class.Training.trm_training --paired_file ".\storico_output\trm_log\training\test.jsonl" --device cpu --epochs 8 --batch_size 32 --save ".\aiConfig\trm_from_paired.ckpt"
-# python -m Class.Training.trm_training --paired_file "\storico_output\trm_log\training\trm_paired_dataset_20251030_192606.jsonl" --device cpu --epochs 8 --batch_size 32 --lr 1e-3 --val_frac 0.2 --save ".\aiConfig\trm_from_paired.ckpt"
+# python -m Class.Training.trm_training --paired_file ".\storico_output\trm_log\training\trm_paired_dataset_20251030_192606.jsonl" --device cpu --epochs 8 --batch_size 32 --lr 1e-3 --val_frac 0.2 --save ".\aiConfig\trm_from_paired.ckpt"
+
+# python -m Class.Training.trm_training --log_path ".\storico_output\trm_log\shadow_actions.jsonl" --device cpu --epochs 8 --batch_size 32 --lr 1e-3 --val_frac 0.2 --save ".\aiConfig\trm_from_shadow.ckpt" --mode supervised --hold_max_frac 1.0

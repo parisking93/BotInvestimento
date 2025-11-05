@@ -250,7 +250,7 @@ ALL_EXEC_REPORTS = []
 
 # 1) Sorgente STREAMING da InfoMarket2
 # istanzia InfoMarket2 in modalità streaming
-im2 = InfoMarket2(per_run=5, total=100, quote="EUR", verbose=True, only_positions=False)
+im2 = InfoMarket2(per_run=1, total=100, quote="EUR", verbose=True, only_positions=False)
 source_aiter = im2.stream_async()   # <--- async iterator di batch da 15 oggetti
 
 from dataclasses import asdict
@@ -294,22 +294,11 @@ async def deliver_fn(item):
     symbols = [obj.get("pair") for obj in batch_objs]
     print(f"[deliver_fn#{batch_id}] start per {symbols}")
 
-    # if judged["actions"] and len(judged["actions"]):
-    #     ai.update_weights_from_kraken(actions_ai=judged["actions"], lookback_hours=24)
-
-    # res_ai = ai.run(currencies=batch_objs, actions=judged["actions"], replace=True)
-    # actions = res_ai["actions_ai"]
     actions = judged["actions"]
     neural = next(s for s in ai.strategies if s.name == "Neural")
-    print("backend torch? ", neural._use_torch,
-        "feature_kind:", neural.feature_kind,
-        "scaler_dim:", neural.d_in,
-        "scaler_loaded_kind:", getattr(neural, "_scaler_loaded_kind", None))
-
-    # print(res_ai["scores"])
 
     runner = KrakenOrderRunner(pair_map={s: s for s in symbols})
-    bodies = runner.build_bodies(actions, validate=False, auto_brackets=False)
+    bodies = runner.build_bodies(actions, validate=True, auto_brackets=False)
     test = runner.execute_bodies(bodies, timeout=0.8)
 
 
@@ -323,17 +312,11 @@ async def deliver_fn(item):
     print(f"[deliver_fn#{batch_id}] pnl_delta_goal = {pnl_delta:.2f} EUR (incrementale)")
     report = ai.update_weights_from_kraken(actions_ai=actions, lookback_hours=72)
 
-    print('report')
 
-    # print(report)
-    print('report end')
-
-    print('bodies')
 
     for acts in actions:
         print(acts) if acts.get('tipo') != 'hold' else print(f"pair: {acts.get('pair')}, side: {acts.get('side')}")
 
-    print('teswt')
 
     for tests in test:
         print(tests)
@@ -346,7 +329,7 @@ async def deliver_fn(item):
     print(f"[deliver_fn#{batch_id}] done — bodies={len(bodies)}")
 
 cfg = PipelineConfig(
-    batch_size=5,
+    batch_size=1,
     max_in_flight_batches=4,
     judge_cfg=StageConfig(concurrency=2, timeout=200, retries=0),
     deliver_cfg=StageConfig(concurrency=2, timeout=90, retries=0),

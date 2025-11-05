@@ -671,6 +671,9 @@ class InfoMarket:
         limits_map: Dict[str, Optional[dict]] = {}
         if not ai_batch.get("error"):
             for code, row in ai_batch["result"].items():
+                # -- estrai array di leve (se la coppia supporta il margine) --
+                lb = row.get("leverage_buy") or []
+                ls = row.get("leverage_sell") or []
                 limits_map[code] = {
                     "lot_decimals": row.get("lot_decimals") or row.get("pair_decimals"),
                     "ordermin": float(row.get("ordermin")) if row.get("ordermin") is not None else None,
@@ -678,8 +681,12 @@ class InfoMarket:
                     "fees": row.get("fees") or [], # [[threshold_usd, pct], ...] (taker)
                     "fees_maker": row.get("fees_maker") or row.get("fees_maker_tier") or [],
                     "fee_volume_currency": row.get("fee_volume_currency") or "ZUSD",
-                    "levarage_buy" : bool(row.get("leverage_buy")),
-                    "levarage_sell" : bool(row.get("leverage_sell"))
+                    "leverage_buy": lb,                      # array es. [2,3,5] oppure []
+                    "leverage_sell": ls,                     # array es. [2,3,5] oppure []
+                    "leverage_buy_max": (max(lb) if lb else 0),
+                    "leverage_sell_max": (max(ls) if ls else 0),
+                    "can_leverage_buy": bool(lb),
+                    "can_leverage_sell": bool(ls),
                 }
 
         out_array: List[Dict[str, Any]] = []

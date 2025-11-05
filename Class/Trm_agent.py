@@ -226,6 +226,8 @@ class AutoFeaturizer:
         # portfolio for aux
         pf = (row.get("portfolio") or {})
         avail = (pf.get("available") or {})
+        pos_row = (pf.get("row") or {})
+        pos_base_qty = self._num(pos_row.get("qty"))
         free_quote = self._num(avail.get("quote"))
         free_base  = self._num(avail.get("base"))
 
@@ -257,16 +259,41 @@ class AutoFeaturizer:
         fee_maker = self._num((pl.get("fee_maker") or pl.get("maker_fee") or 0.001))
         fee_taker = self._num((pl.get("fee_taker") or pl.get("taker_fee") or 0.001))
         # aux per decoder
+        lev_buy_max  = int(pl.get("leverage_buy_max") or 0)
+        lev_sell_max = int(pl.get("leverage_sell_max") or 0)
+        # feature hashed (aiuta il modello a capire dove può usare leva)
+        self._add(vec, "pair_limits.leverage_buy_max:num", lev_buy_max)
+        self._add(vec, "pair_limits.leverage_sell_max:num", lev_sell_max)
+
         aux = {
             "pair":[pair], "mid":[mid], "bid":[bid], "ask":[ask],
             "lot_decimals":[lot_dec], "pair_decimals":[pair_dec], "ordermin":[ordermin],
             "free_quote":[free_quote], "free_base":[free_base],
             "pos_margin_base":[pos_margin_base],
+            "pos_base":[pos_base_qty],
             "slippage_in":[slip_in], "slippage_out":[slip_out],
             "fee_maker":[fee_maker], "fee_taker":[fee_taker],
             "max_quote_frac":[float(strategy_weights.get("max_quote_frac",0.12))],
             "min_notional_eur":[float(strategy_weights.get("min_notional_eur",5.0))],
+            "lev_buy_max":  [lev_buy_max],
+            "lev_sell_max": [lev_sell_max],
         }
+
+        unit = max(mid, 1e-9)  # per normalizzare EUR -> "pezzi" circa
+
+        # liquidità disponibile
+        self._add(vec, "aux.free_quote_scaled:num", math.log1p(free_quote / unit))
+        self._add(vec, "aux.free_base_scaled:num",  math.log1p(max(0.0, free_base)))
+
+        # minimo scambiabile (ordermin è in base units): normalizza e log1p
+        self._add(vec, "aux.ordermin_scaled:num",   math.log1p(max(0.0, ordermin)))
+
+        # pressione da posizione a margine (positiva long, negativa short)
+        self._add(vec, "aux.pos_margin_base_tanh:num", math.tanh(pos_margin_base))
+
+        # policy di run/config
+        self._add(vec, "aux.max_quote_frac:num", float(strategy_weights.get("max_quote_frac", 0.12)))
+        self._add(vec, "aux.min_notional_eur_scaled:num", math.log1p(float(strategy_weights.get("min_notional_eur", 5.0)) / unit))
 
         # -------- 1) row flatten (tutti i campi) --------
         flat = _flatten_dict(row)
@@ -366,8 +393,7 @@ class AutoFeaturizer:
 
         # --- NEW: 3) Inventory & pending pressure ---
         # pos_base stimata dal portfolio.row.qty (come nel dataset) e mid
-        pos_row = (pf.get("row") or {})
-        pos_base_qty = self._num(pos_row.get("qty"))
+
         pos_val_eur = pos_base_qty * mid if mid > 0 else 0.0
         inv_pressure = (pos_val_eur / (abs(free_quote) + 1e-9)) if free_quote > 0 else 0.0
         # pendency: usa la tua funzione già calcolata (netto ordini aperti)
@@ -390,7 +416,6 @@ class AutoFeaturizer:
 
         # --- NEW: cross utile tra i due regimi che già calcoli sopra ---
         self._add(vec, "derived.trendXvol:num", float(trend_bias) * float(vol_regime))
-
 
         return vec, aux
 
@@ -749,6 +774,13 @@ class TinyRecursiveModel(nn.Module):
                 sc = float(score[i].item())
                 lev_out = (lev_raw if (sc >= 0.6 and lev_raw > 1.0) else None)
 
+                # blocca o clippa la leva se la coppia non la supporta
+                lev_max_allowed = int(aux["lev_buy_max"][i]) if is_buy else int(aux["lev_sell_max"][i])
+                if lev_max_allowed <= 1:
+                    lev_out = None
+                elif lev_out is not None and lev_out > lev_max_allowed:
+                    lev_out = float(lev_max_allowed)
+
                 actions.append(Action(
                     pair=pair, side=side, qty=qty, price=price_out,
                     ordertype=ordertype,
@@ -883,7 +915,7 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
         X = []
         aux = {k:[] for k in ["pair","mid","bid","ask","lot_decimals","pair_decimals",
                                "ordermin","free_quote","free_base","pos_margin_base",
-                               "slippage_in","slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur"]}
+                               "slippage_in","slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur","lev_buy_max","lev_sell_max"]}
         for row, blend in zip(rows, blends):
             v, a = _auto_feat.featurize(row, blend, goal_state, strategy_weights)
             # --- INIETTA segnali di contesto per il GRU (per ogni riga del batch) ---
@@ -1046,6 +1078,11 @@ class TRMAgent:
             mem_list.append(self.memory.memory_feats_for(pair))
         run_aux["mem"] = mem_list
         X, aux = featurize_batch(rows, blends, goal_state, strategy_weights, run_aux=run_aux)
+
+        print("FEAT", X.shape, "nonzero_total:", int((X!=0).sum()))
+        nnz_per_row = (X!=0).sum(dim=1)
+        print("nnz[min,max,mean] =", int(nnz_per_row.min()), int(nnz_per_row.max()), float(nnz_per_row.float().mean()))
+        assert (X!=0).any(), "X è tutto zero: featurize_batch sta perdendo le feature"
         # Trm_agent.py → dentro propose_actions_for_batch(...), dopo featurize_batch
         # --- NEW: cap per-pair guidato da TimesFM (se presente in row.info.FORECAST)
         cap_list = []
