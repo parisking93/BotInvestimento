@@ -396,7 +396,7 @@ class AutoFeaturizer:
 
 # Flag per attivare il featurizer schema-free
 USE_HASH_FEATS = True
-HASH_DIM = 4096 # puoi portarlo a 1024/2048 se vuoi più capacità
+HASH_DIM = 8192 # puoi portarlo a 1024/2048 se vuoi più capacità
 
 @dataclass
 class Action:
@@ -431,9 +431,9 @@ class Action:
 @dataclass
 class TRMConfig:
     feature_dim: int = 128
-    hidden_dim: int = 64
-    mlp_hidden: int = 128
-    K_refine: int = 4
+    hidden_dim: int = 128
+    mlp_hidden: int = 256
+    K_refine: int = 6
     max_actions_per_pair: int = 2
     norm_eps: float = 1e-6
     log_path: Optional[str] = None
@@ -444,6 +444,10 @@ class TRMConfig:
     super_conf_sideprob: float = 0.65
     run_currencies_left: Optional[int] = None
     memory_path: Optional[str] = None
+    act_enabled: bool = True           # abilita halting adattivo (se False usa K fisso)
+    act_threshold: float = 0.60
+    act_min_steps: int = 1
+    # passi minimi prima di poter fermare
 # -----------------------------
 # Running normalizer
 # -----------------------------
@@ -487,6 +491,8 @@ class TinyRecursiveModel(nn.Module):
             nn.ReLU(),
             nn.Linear(cfg.mlp_hidden, self.y_dim)
         )
+        self.y0_proj = nn.Linear(cfg.feature_dim, cfg.hidden_dim, bias=False)
+        nn.init.xavier_normal_(self.y0_proj.weight)
         # Heads
         self.head_side = nn.Linear(self.y_dim, 3)   # buy/sell/hold logits
         self.head_qty  = nn.Linear(self.y_dim, 1)   # 0..1 fraction
@@ -498,6 +504,7 @@ class TinyRecursiveModel(nn.Module):
         self.head_score= nn.Linear(self.y_dim, 1)   # ranking
         self.head_ordertype = nn.Linear(self.y_dim, 2)  # logits: 0=limit, 1=market
         self.head_reduce    = nn.Linear(self.y_dim, 1)  # sigmoid -> prob reduce_only
+        self.head_halt      = nn.Linear(self.y_dim, 1)  # sigmoid -> p_halt (ACT)
         self.to(cfg.device)
 
     def encode_once(self, x: torch.Tensor, h: Optional[torch.Tensor] = None):
@@ -521,6 +528,67 @@ class TinyRecursiveModel(nn.Module):
         for _ in range(K):
             y, h = self.forward(x_n, y, h)
         return y
+
+    @torch.no_grad()
+    def improve_adaptive(
+        self,
+        x: torch.Tensor,
+        y0: Optional[torch.Tensor] = None,
+        max_steps: Optional[int] = None,
+        min_steps: Optional[int] = None,
+        threshold: float = 0.60,
+        return_stats: bool = True,
+    ):
+        """
+        ACT: ad ogni passo predice p_halt e decide se fermarsi per elemento di batch.
+        Usa la stessa normalizzazione di improve() ed è retro-compatibile.
+        """
+        self.eval()
+        T = int(max_steps or self.cfg.K_refine)
+        m = int(min_steps or getattr(self.cfg, "act_min_steps", 1) or 1)
+        x_n = self.norm(x)
+        B = x_n.shape[0]
+        y = torch.zeros(B, self.y_dim, device=x_n.device) if y0 is None else y0.to(x_n.device).view(B, self.y_dim)
+        h = None
+
+        stopped = torch.zeros(B, dtype=torch.bool, device=x_n.device)
+        steps   = torch.zeros(B, dtype=torch.int64, device=x_n.device)
+        last_p  = torch.zeros(B, dtype=torch.float32, device=x_n.device)
+        last_t  = 0
+
+        for t in range(T):
+            last_t = t + 1
+            y_new, h_new = self.forward(x_n, y, h)
+            p_halt = torch.sigmoid(self.head_halt(y_new)).squeeze(-1)
+            last_p = p_halt
+
+            can_halt = (last_t >= m)
+            stop_now = (~stopped) & can_halt & (p_halt >= threshold)
+
+            if stop_now.any():
+                steps[stop_now] = last_t
+            stopped = stopped | stop_now
+
+            if (~stopped).any():
+                y[~stopped] = y_new[~stopped]
+                if h_new is not None:
+                    if h is None:
+                        h = h_new
+                    else:
+                        h[:, ~stopped, :] = h_new[:, ~stopped, :]
+
+            if stopped.all():
+                break
+
+        steps = torch.where(steps == 0, torch.full_like(steps, last_t), steps)
+        if return_stats:
+            return y, {
+                "steps": steps.detach().cpu().tolist(),
+                "p_halt": last_p.detach().cpu().tolist(),
+                "threshold": float(threshold),
+            }
+        return y
+
 
     @torch.no_grad()
     def decode_actions(self, y: torch.Tensor, aux: Dict[str, List[Any]]) -> List[Action]:
@@ -961,9 +1029,8 @@ class TRMAgent:
             print(f"[WARN] could not log uncertain decision_id: {e}")
 
     def _seed_y0(self, Xn: torch.Tensor) -> torch.Tensor:
-        B, D = Xn.shape
-        W = torch.randn(D, self.cfg.hidden_dim, device=Xn.device) * 0.01
-        return Xn @ W
+        with torch.no_grad():
+            return self.model.y0_proj(Xn)
 
     @torch.no_grad()
     def propose_actions_for_batch(self, rows: List[Dict[str,Any]], blends: List[Dict[str,Number]], goal_state: Dict[str,Any], strategy_weights: Dict[str,Number], K: Optional[int] = None, shadow_log: bool = True) -> List[Action]:
@@ -1034,8 +1101,23 @@ class TRMAgent:
         self.model.norm.update(X)
         Xn = self.model.norm(X)
         y0 = self._seed_y0(Xn)
-        yK = self.model.improve(X, y0=y0, K=K)
+        act_stats = None
+        if getattr(self.cfg, "act_enabled", False):
+            yK, act_stats = self.model.improve_adaptive(
+                X, y0=y0,
+                max_steps=int(K or self.cfg.K_refine),
+                min_steps=int(getattr(self.cfg, "act_min_steps", 1)),
+                threshold=float(getattr(self.cfg, "act_threshold", 0.60)),
+                return_stats=True,
+            )
+        else:
+            yK = self.model.improve(X, y0=y0, K=K)
+
         actions = self.model.decode_actions(yK, aux)
+        if act_stats is not None:
+            for i, a in enumerate(actions):
+                a.notes = (a.notes or "") + f" | act_steps={int(act_stats['steps'][i])} | p_halt={float(act_stats['p_halt'][i]):.2f}"
+
         by_pair: Dict[str, List[Action]] = {}
         for a in actions: by_pair.setdefault(a.pair, []).append(a)
         pair2input = {}
@@ -1099,6 +1181,10 @@ class TRMAgent:
             acts.sort(key=lambda a: a.score, reverse=True)
             final.extend(acts[: self.cfg.max_actions_per_pair])
 
+        rows_index = {}
+        for idx, r in enumerate(rows):
+            rows_index[r.get("pair") or f"{r.get('base','?')}/{r.get('quote','?')}"] = idx
+
         if shadow_log:
             for a in final:
                 decision_id = str(uuid.uuid4())
@@ -1135,6 +1221,14 @@ class TRMAgent:
                     "edge_h": fc.get("edge_h"), "uncert_h": fc.get("uncert_h"),
                     "p10_T1": fc.get("p10_T1"), "p50_T1": fc.get("p50_T1"), "p90_T1": fc.get("p90_T1"),
                 }
+                if act_stats is not None:
+                    _idx = rows_index.get(a.pair, None)
+                    if _idx is not None:
+                        payload["act"] = {
+                            "steps": int(act_stats["steps"][_idx]),
+                            "p_halt": float(act_stats["p_halt"][_idx]),
+                            "threshold": float(getattr(self.cfg, "act_threshold", 0.60)),
+                        }
                 # scrivi nel JSONL
                 self.logger.log(payload)
                 # opzionale: attacca l'id all'azione così chi esegue può ributtarlo nel log ‘execution/close’

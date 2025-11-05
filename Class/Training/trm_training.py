@@ -13,6 +13,7 @@ import torch.optim as optim
 from ..Trm_agent import TRMAgent, featurize_batch, TinyRecursiveModel, TRMConfig # :contentReference[oaicite:0]{index=0}
 from ..Trm_agent import Action  # solo per typing
 from ..Util import _shadow_daily_path  # helper giornaliero
+import torch.nn.functional as F
 
 Number = float | int
 
@@ -328,6 +329,61 @@ class TRMTrainer:
         # memoria
         self.memory = TRMMemory(memory_path)
 
+    def _budget_penalty(self, heads: Dict[str, torch.Tensor], x_aux: Dict[str, List[Any]]) -> torch.Tensor:
+        """
+        Penalizza la parte di qty_frac che eccede il tetto per pair.
+        Usa aux['max_quote_frac'] (es. 0.12). Output: tensore [B] (qui B=1 nel tuo loop).
+        """
+        qf = heads["qty"].view(-1)  # [B], già sigmoid 0..1
+        try:
+            # aux["max_quote_frac"] può essere lista o scalare
+            mxf = x_aux.get("max_quote_frac", 0.12)
+            max_qf = float(mxf[0] if isinstance(mxf, list) else mxf)
+        except Exception:
+            max_qf = 0.12
+        return torch.relu(qf - max_qf)
+
+    def _market_regularizer(self, heads: Dict[str, torch.Tensor], x_aux: Dict[str, List[Any]]) -> torch.Tensor:
+        """
+        Penalità = p_market * costo_relativo.
+        p_market è la prob softmax della classe 'market' nelle head di ordertype.
+        costo_relativo ~ cost_eur / mid (proxy in bps/percent).
+        """
+        ord_logits = heads["ord_logits"]          # [B,2]
+        p_market = torch.softmax(ord_logits, dim=-1)[:, 1]  # [B]
+        # costo atteso (eur) usando buy come proxy (va bene anche per sell come ordine indicativo)
+        fake_tgt = {"ordertype": "market", "side": "buy"}
+        cost_eur = self._trade_cost_est(x_aux, fake_tgt).to(p_market.device).view(-1)  # [B]
+        try:
+            mid = float((x_aux.get("mid") or [0.0])[0] or 0.0)
+        except Exception:
+            mid = 0.0
+        rel_cost = (cost_eur / max(mid, 1e-6)) if mid > 0 else cost_eur  # se mid manca, usa assoluto
+        return p_market * rel_cost
+
+    def _cycle_hinge(self, pnl_value: Optional[float], x_aux: Dict[str, List[Any]],
+                    heads: Dict[str, torch.Tensor], tgt: Dict[str, torch.Tensor],
+                    margin: float = 0.0) -> torch.Tensor:
+        """
+        Hinge: max(0, margin - (PNL_netto)) applicata SOLO alle chiusure (reduce==1),
+        ponderata dalla probabilità di esecuzione (1 - P(hold)).
+        Se non c’è pnl_value, torna zero.
+        """
+        reduces = tgt["reduce"].view(-1)  # [B]  (1.0 = chiusura)
+        if pnl_value is None:
+            return torch.zeros_like(reduces)
+
+        # costo stimato (eur) dal punto di vista generico
+        cost_eur = self._trade_cost_est(x_aux, {"ordertype": "limit", "side": "buy"}).to(reduces.device).view(-1)  # [B]
+        pnl = torch.tensor([float(pnl_value)], dtype=torch.float32, device=reduces.device)  # [1]
+        edge = pnl - cost_eur  # pnl netto
+
+        # p_exec ≈ 1 - P(hold)
+        p_side = torch.softmax(heads["logits_side"], dim=-1)  # [B,3]
+        p_hold = p_side[:, 2]                                 # [B]
+        p_exec = (1.0 - p_hold).view(-1)
+
+        return reduces * torch.relu(float(margin) - edge) * p_exec
 
     def _estimate_side_class_weights(self, dataset) -> torch.Tensor:
         # 0=buy, 1=sell, 2=hold
@@ -431,6 +487,18 @@ class TRMTrainer:
         else:
             loss_side = ce_side
 
+            extra = getattr(self, "_extra_terms", None)
+            if extra is not None:
+                loss_budget, loss_market, loss_cycle = extra  # ciascuno [B]
+                # pesi iniziali (tunable)
+                lam_budget = 0.50
+                lam_market = 0.25
+                lam_cycle  = 0.50
+                return (loss_side + 0.5*ce_ord + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce
+                        + lam_budget*loss_budget.mean()
+                        + lam_market*loss_market.mean()
+                        + lam_cycle*loss_cycle.mean()).mean()
+
         return (loss_side + 0.5*ce_ord + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce).mean()
 
     def _trade_cost_est(self, x_aux: dict, target: dict) -> torch.Tensor:
@@ -519,11 +587,17 @@ class TRMTrainer:
             X = X.to(self.device)
             self.model.norm.update(X)
             Xn = self.model.norm(X)
-            y0 = torch.zeros(1, self.model.y_dim, device=self.device)
-            yK = self.model.improve(Xn, y0=y0, K=self.agent.cfg.K_refine)
-
+            y0 = self.model.y0_proj(Xn)                  # y0 learnable, NO random
+            yK = self.model.improve(X, y0=y0, K=self.agent.cfg.K_refine)  # passa X (raw), non Xn
             h = self._forward_heads(yK)
             tgt = self._targets_from_action(aux, s.target)
+
+            # --- costruisci le tre componenti ---
+            pen_budget = self._budget_penalty(h, aux)
+            pen_market = self._market_regularizer(h, aux)
+            cycle_h    = self._cycle_hinge(s.pnl, aux, h, tgt, margin=0.0)  # margin 0 = “almeno non perdere”
+            # esponi al calcolo della loss
+            self._extra_terms = (pen_budget, pen_market, cycle_h)
 
             reward_w = None
             m = mode.lower()
@@ -541,7 +615,7 @@ class TRMTrainer:
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.opt.step()
-
+            self._extra_terms = None
             running += float(loss.item()); n += 1
 
         return (running / max(n,1))
@@ -566,11 +640,17 @@ class TRMTrainer:
             X, aux = featurize_batch([s.x_row], [s.blend], s.goal_state, s.weights, run_aux=run_aux)
             X = X.to(self.device)
             Xn = self.model.norm(X)
-            y0 = torch.zeros(1, self.model.y_dim, device=self.device)
-            yK = self.model.improve(Xn, y0=y0, K=self.agent.cfg.K_refine)
+            y0 = self.model.y0_proj(Xn)                  # y0 learnable, NO random
+            yK = self.model.improve(X, y0=y0, K=self.agent.cfg.K_refine)
             h = self._forward_heads(yK)
             tgt = self._targets_from_action(aux, s.target)
+            pen_budget = self._budget_penalty(h, aux)
+            pen_market = self._market_regularizer(h, aux)
+            cycle_h    = self._cycle_hinge(s.pnl, aux, h, tgt, margin=0.0)  # margin 0 = “almeno non perdere”
+            # esponi al calcolo della loss
+            self._extra_terms = (pen_budget, pen_market, cycle_h)
             loss = self._loss_supervised(h, tgt, reward_sig=None)
+            self._extra_terms = None
             tot += float(loss.item()); n += 1
         return {"loss": tot / max(n,1)}
 
@@ -630,8 +710,8 @@ class TRMTrainer:
         X = X.to(self.device)
         self.model.norm.update(X)
         Xn = self.model.norm(X)
-        y0 = torch.zeros(1, self.model.y_dim, device=self.device)
-        yK = self.model.improve(Xn, y0=y0, K=self.agent.cfg.K_refine)
+        y0 = self.model.y0_proj(Xn)                  # y0 learnable, NO random
+        yK = self.model.improve(X, y0=y0, K=self.agent.cfg.K_refine)
         logits_side = self.model.head_side(yK)
         p_side = torch.softmax(logits_side, dim=-1)
         conf, idx = p_side.max(dim=-1)
