@@ -1,6 +1,7 @@
 import os, json, tempfile, time
 import datetime as _dt
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+import math
 
 def _shadow_jsonl_upsert_after(log_path: str, decision_id: str, after_payload: dict) -> bool:
     """
@@ -330,3 +331,27 @@ def _net_margin_from_open_orders(row: Dict[str, Any]) -> float:
         except Exception:
             continue
     return float(net)
+
+
+
+def _finite(x, default=0.0):
+    try:
+        xf = float(x)
+        return xf if math.isfinite(xf) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _rel(v, t0):
+    try:
+        return (float(v) - t0) / t0 if (v and v > 0.0) else 0.0
+    except Exception:
+        return 0.0
+
+def _rel_to(level, val):
+    try:
+        if level is None or val is None or float(level) == 0.0:
+            return None
+        return (float(val) - float(level)) / float(level)
+    except Exception:
+        return None

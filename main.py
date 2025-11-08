@@ -250,7 +250,7 @@ ALL_EXEC_REPORTS = []
 
 # 1) Sorgente STREAMING da InfoMarket2
 # istanzia InfoMarket2 in modalità streaming
-im2 = InfoMarket2(per_run=1, total=400, quote="EUR", verbose=True, only_positions=False)
+im2 = InfoMarket2(per_run=1, total=300, quote="EUR", verbose=True, only_positions=False)
 source_aiter = im2.stream_async()   # <--- async iterator di batch da 15 oggetti
 
 from dataclasses import asdict

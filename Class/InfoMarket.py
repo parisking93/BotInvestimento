@@ -9,7 +9,7 @@ try:
     from Class.KrakenPortfolio import KrakenPortfolio
 except ImportError:
     from KrakenPortfolio import KrakenPortfolio
-
+import re
 
 # --- AGGIUNTA IN FONDO A InfoMarket.py ---------------------------------------
 # Richiede: websockets (pip install websockets)
@@ -45,6 +45,21 @@ def _date_str(ts: Optional[float] = None) -> str:
     d = _dt.datetime.fromtimestamp(ts or _dt.datetime.now().timestamp())
     return d.strftime("%Y%m%d")
 
+
+
+def percent_times_100(s: str) -> Optional[float]:
+    """
+    Estrae il primo numero immediatamente seguito da '%' nella stringa s
+    e ritorna quel numero * 100. Esempio: '0.0200% per 4 hours' -> 2.0
+    """
+    if not s:
+        return None
+    m = re.search(r'([-+]?\d+(?:[.,]\d+)?)\s*%', s)
+    if not m:
+        return None
+    # Supporta sia virgola che punto decimale
+    val = float(m.group(1).replace(',', '.'))
+    return val * 100.0
 
 
 # --- merge helpers (portati da bot3.py) ---
@@ -1344,6 +1359,14 @@ class InfoMarket2:
                 base_code  = rowp.get("base")
                 quote_code = rowp.get("quote")
 
+            terms = None
+            if p.get("terms") is not None:
+                stringterms = p.get("terms")
+                try:
+                    terms = percent_times_100(stringterms)
+                except Exception:
+                    terms = None
+
             simple_open_orders.append({
                 "source": "position",
                 "kr_pair": pair_field or p.get("pair") or p.get("pairname"),
@@ -1355,7 +1378,8 @@ class InfoMarket2:
                 "vol_rem": vol,  # qui consideriamo tutta la size della posizione
                 "base": base_code,
                 "quote": quote_code,
-                "txid": pos_txid
+                "txid": pos_txid,
+                "Lev": terms
             })
 
 

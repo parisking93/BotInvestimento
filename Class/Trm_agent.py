@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import re
 
-from .Util import _shadow_daily_path, _net_margin_from_open_orders
+from .Util import _shadow_daily_path, _net_margin_from_open_orders, _finite, _rel, _rel_to
 
 
 # -----------------------------
@@ -255,7 +255,9 @@ class AutoFeaturizer:
     def _add(self, vec, key, val=1.0):
         i = _hash_idx(key, self.dim)
         try:
-            vec[i] += float(val)
+            fv = float(val)
+            if math.isfinite(fv):
+                vec[i] += float(val)
         except Exception:
             pass
 
@@ -300,6 +302,55 @@ class AutoFeaturizer:
         ema50_1h  = self._num(((info.get("1H") or {}).get("EMA50") if isinstance(info.get("1H"), dict) else (now.get("ema50_1h"))))
         ema200_1h = self._num(((info.get("1H") or {}).get("EMA200") if isinstance(info.get("1H"), dict) else (now.get("ema200_1h"))))
         atr_4h    = self._num(((info.get("4H") or {}).get("atr")    if isinstance(info.get("4H"), dict) else (now.get("atr_4h"))))
+
+        fc_meta = (info.get("FORECAST_META") or {})
+        p50 = fc_meta.get("p50") if isinstance(fc_meta.get("p50"), (list, tuple)) else None
+        t_m1 = self._num(((info.get("24H") or {}).get("start_price")))
+        t_m2 = self._num(((info.get("48H") or {}).get("start_price")))
+        t0 = mid if (mid and mid > 0.0) else 0
+        t_p1 = float(p50[0]) if (isinstance(p50, (list, tuple)) and len(p50) >= 1 and _is_num(p50[0])) else 0
+        t_p2 = float(p50[1]) if (isinstance(p50, (list, tuple)) and len(p50) >= 2 and _is_num(p50[1])) else 0
+
+
+        tpv_vals = [
+            float(t_m2 or 0.0),  # t-2  (48H start_price)
+            float(t_m1 or 0.0),  # t-1  (24H start_price)
+            float(t0   or 0.0),  # t0   (NOW.mid)
+            float(t_p1 or 0.0),  # t+1  (forecast p50[0])
+            float(t_p2 or 0.0),  # t+2  (forecast p50[1])
+        ]
+        tpv_has = 1.0 if any([t_m2, t_m1, t0, t_p1, t_p2]) else 0.0
+
+        if t0 and t0 > 0.0:
+            self._add(vec, "tpv.t-2.rel_t0:num", _rel(t_m2, t0))
+            self._add(vec, "tpv.t-1.rel_t0:num", _rel(t_m1, t0))
+            self._add(vec, "tpv.t+1.rel_t0:num", _rel(t_p1, t0))
+            self._add(vec, "tpv.t+2.rel_t0:num", _rel(t_p2, t0))
+            # pendenza forward (t+2 - t+1) / t0
+            try:
+                if t_p2 and t_p1:
+                    self._add(vec, "tpv.fwd_slope:num", (float(t_p2) - float(t_p1)) / t0)
+            except Exception:
+                pass
+            # direzione forward semplice (segno di t+1 - t0)
+            try:
+                self._add(vec, "tpv.dir_fwd:num", math.copysign(1.0, (float(t_p1) - t0)) if (t_p1 and t_p1 != t0) else 0.0)
+            except Exception:
+                pass
+        # 2) associazione ai pivot principali: distanze relative per t0 e t+1
+        levels = pivot_ctx.get("levels", {}) if isinstance(pivot_ctx, dict) else {}
+
+        for name in ("pp","r1","r2","s1","s2"):
+            lvl = levels.get(name)
+            if lvl is None:
+                continue
+            rel_t0 = _rel_to(lvl, t0)
+            rel_t1 = _rel_to(lvl, t_p1)
+            if rel_t0 is not None:
+                self._add(vec, f"tpv.t0.rel_{name}:num", rel_t0)
+            if rel_t1 is not None:
+                self._add(vec, f"tpv.t+1.rel_{name}:num", rel_t1)
+
         trend_bias = 0.0
         vol_regime = 0.0
         if mid > 0.0 and ema50_1h and ema200_1h:
@@ -394,8 +445,12 @@ class AutoFeaturizer:
 
         unit = max(mid, 1e-9)  # per normalizzare EUR -> "pezzi" circa
 
+        _ratio = (free_quote / unit) if unit > 0 else 0.0
+        _ratio = max(_ratio, -0.999999)  # FIX: evita log1p(x<=-1)
+        self._add(vec, "aux.free_quote_scaled:num", math.log1p(_ratio))
+        self._add(vec, "aux.free_quote_sign:num", 1.0 if free_quote >= 0 else -1.0)
         # liquidità disponibile
-        self._add(vec, "aux.free_quote_scaled:num", math.log1p(free_quote / unit))
+        # self._add(vec, "aux.free_quote_scaled:num", math.log1p(free_quote / unit))
         self._add(vec, "aux.free_base_scaled:num",  math.log1p(max(0.0, free_base)))
 
         # minimo scambiabile (ordermin è in base units): normalizza e log1p
@@ -610,6 +665,7 @@ class RunningNorm(nn.Module):
 
     def update(self, x: torch.Tensor) -> None:
         if x.ndim == 1: x = x.unsqueeze(0)
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         batch_n = torch.tensor(x.shape[0], device=x.device, dtype=self.count.dtype)
         batch_mean = x.mean(0)
         batch_var  = x.var(0, unbiased=False)
@@ -745,7 +801,11 @@ class TinyRecursiveModel(nn.Module):
         logits_side = self.head_side(y)
         p_side = torch.softmax(logits_side, dim=-1)
         qty_frac = torch.sigmoid(self.head_qty(y)).squeeze(-1)
-        px_off = torch.tanh(self.head_px(y)).squeeze(-1) * 0.05
+
+        px_raw = self.head_px(y)
+        px_raw = torch.nan_to_num(px_raw, nan=0.0, posinf=0.0, neginf=0.0)            # FIX
+        px_off = torch.tanh(px_raw).squeeze(-1) * 0.05
+
         tp_mult = F.softplus(self.head_tp(y)).squeeze(-1) * 0.01
         sl_mult = F.softplus(self.head_sl(y)).squeeze(-1) * 0.01
         tif_idx = torch.argmax(self.head_tif(y), dim=-1)
@@ -785,7 +845,7 @@ class TinyRecursiveModel(nn.Module):
             free_base = _f(aux["free_base"][i], 0.0)
             max_qfrac = float(aux.get("max_quote_frac", [0.12])[i] if isinstance(aux.get("max_quote_frac"), list) else aux.get("max_quote_frac", 0.12))
             min_notional = float(aux.get("min_notional_eur", [5.0])[i] if isinstance(aux.get("min_notional_eur"), list) else aux.get("min_notional_eur", 5.0))
-
+            minOrder =  float(aux.get("minOrder", [0.0])[i])
             tp_hint = float((aux.get("tp_mult_hint") or [0.0])[i])
             sl_hint = float((aux.get("sl_mult_hint") or [0.0])[i])
             tfs = float((aux.get("timesfm_sig") or [0.0])[i])
@@ -796,23 +856,20 @@ class TinyRecursiveModel(nn.Module):
             side_idx = int(torch.argmax(p_side[i]).item())
             p_hat = float(p_side[i, side_idx].item())
             H = float((-(p_side[i] * torch.log(p_side[i] + 1e-12)).sum()).item())
-            is_buy = (side_idx == 0)
-            side = "buy" if is_buy else "sell"
 
-            anchor = bid if is_buy else ask
-            base_px = mid if mid > 0 else anchor
-            px = base_px * (1.0 + float(px_off[i].item()))
-            px = round(px, pair_dec)
+            is_buy  = (side_idx == 0)
+            is_hold = (side_idx == 1)
+            is_sell = (side_idx == 2)
 
-            if side_idx == 2:
-                actions.append(Action(
-                    pair=pair, side="hold", qty=0.0, price=px,
-                    ordertype="none", take_profit=None, stop_loss=None,
-                    leverage=None, time_in_force="GTC",
-                    score=float(score[i].item()), _side_prob=p_hat, _entropy=H,
-                    notes="trade_phase=hold", trade_phase="hold"
-                ))
-                continue
+            side = "buy" if is_buy else ("hold" if is_hold else "sell")
+
+            try:
+                anchor = bid if is_buy else ask
+                base_px = mid if mid > 0 else anchor
+                px = base_px * (1.0 + float(px_off[i].item()))
+                px = round(px, pair_dec)
+            except Exception:
+                px = _finite(bid or ask, 0.0)
 
             tp = px * (1.0 + (tp_eff if is_buy else -tp_eff))
             sl = px * (1.0 - (sl_eff if is_buy else -sl_eff))
@@ -950,7 +1007,7 @@ class TinyRecursiveModel(nn.Module):
                 cap_hint = max(cap_hint, min_notional)
 
             cap_eur = cap_hint if (cap_hint is not None) else float("inf")
-            p_hat_exec = float(torch.max(p_side[i, 0], p_side[i, 1]).item())
+            p_hat_exec = float(torch.max(p_side[i, 0], p_side[i, 2]).item())
             is_super = (abs(float(score[i].item())) >= super_sc) and (p_hat_exec >= super_p)
             if is_super and (rb is not None):
                 cap_eur = min(float(cap_eur) * 3.0, float(rb))
@@ -965,7 +1022,7 @@ class TinyRecursiveModel(nn.Module):
 
             if trade_phase == "close_short":
                 reduce_only = True
-                lev_out = None
+                lev_out = aux["levOpenOrders"][i]
             elif trade_phase == "close_long":
                 if pos_m > _EPS:
                     reduce_only = True
@@ -1010,21 +1067,15 @@ class TinyRecursiveModel(nn.Module):
                 qty = short_available * frac
                 notional = qty * px
 
+            if qty < minOrder:
+                qty = minOrder
+
             qty = round(qty, lot_dec)
-            notional = float(notional)
+            notional = float(qty * px)
 
             if trade_phase in ("close_long", "close_short") and qty <= 0.0:
                 qty = round((long_exposure if trade_phase == "close_long" else short_exposure), lot_dec)
                 notional = qty * px
-
-            if qty <= 0.0 or (trade_phase in ("open_long", "open_short") and notional < min_notional):
-                actions.append(Action(
-                    pair=pair, side="hold", qty=0.0, price=px,
-                    ordertype="none", take_profit=tp, stop_loss=None,
-                    leverage=None, time_in_force="GTC", score=float(score[i].item()),
-                    _side_prob=p_hat, _entropy=H, notes="trade_phase=hold_min", trade_phase="hold"
-                ))
-                continue
 
             oi = int(ord_idx[i].item())
             ordertype = "market" if oi == 1 else "limit"
@@ -1038,6 +1089,7 @@ class TinyRecursiveModel(nn.Module):
             if pivot_has and pivot_notes:
                 note_parts.append("pivot=" + ";".join(pivot_notes))
             note = " | ".join(note_parts)
+
             actions.append(Action(
                 pair=pair, side=side, qty=qty, price=price_out,
                 ordertype=ordertype, take_profit=tp,
@@ -1204,7 +1256,7 @@ def _pivot_context(row: Dict[str, Any], mid: float) -> Dict[str, Any]:
     if dist_up is not None or dist_down is not None:
         up_abs = abs(dist_up) if dist_up is not None else float("inf")
         down_abs = abs(dist_down) if dist_down is not None else float("inf")
-        if math.isfinite(up_abs) or math.isfinite(down_abs):
+        if math.isfinite(up_abs) and math.isfinite(down_abs):
             bias = (down_abs - up_abs)
 
     closeness = None
@@ -1316,8 +1368,8 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
                     mid_now = 0.0
 
                 if isinstance(mems, list):
-                    idx = len(aux["pair"]) - 1
-                    if 0 <= idx < len(mems) and isinstance(mems[idx], dict):
+                    idx = len(X)  # X è la lista dei vettori riga che stai costruendo
+                    if isinstance(mems, list) and 0 <= idx < len(mems) and isinstance(mems[idx], dict):
                         mcur = mems[idx]
                         # dump mem.* come numeric
                         for kk, vv in mcur.items():
@@ -1325,6 +1377,7 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
                             try:
                                 _auto_feat._add(v, f"{key}:num", float(vv))
                             except Exception:
+                                print('errore 1')
                                 pass
                         # derived: TP colpito ora?
                         try:
@@ -1334,9 +1387,12 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
                                 hit = 1.0 if ((ls == "buy" and mid_now >= tp) or (ls == "sell" and mid_now <= tp)) else 0.0
                                 _auto_feat._add(v, "mem.tp_hit_now:bool", hit)
                         except Exception:
+                            print('errore')
                             pass
                         try:
                             entry = float(mcur.get("last_entry_price") or 0.0)
+                            if entry != 0.0:
+                                print('dentro')
                             if mid_now > 0 and entry > 0:
                                 unrealized = (mid_now - entry) / entry
                                 _auto_feat._add(v, "mem.unrealized_pct:num", unrealized)
@@ -1471,9 +1527,13 @@ class TRMAgent:
         nnz_per_row = (X!=0).sum(dim=1)
         print("nnz[min,max,mean] =", int(nnz_per_row.min()), int(nnz_per_row.max()), float(nnz_per_row.float().mean()))
         assert (X!=0).any(), "X è tutto zero: featurize_batch sta perdendo le feature"
+        assert torch.isfinite(X).all(), "Non-finite in X"
+        print("nonfinite in X:", (~torch.isfinite(X)).sum().item())
         # Trm_agent.py → dentro propose_actions_for_batch(...), dopo featurize_batch
         # --- NEW: cap per-pair guidato da TimesFM (se presente in row.info.FORECAST)
         cap_list = []
+        levOpenOrders = []
+        minOrder = []
         # Trm_agent.py (dentro propose_actions_for_batch, dopo cap_list)
         tp_hints, sl_hints, side_hints, sigs = [], [], [], []
         for r in rows:
@@ -1484,6 +1544,10 @@ class TRMAgent:
             sl_hints.append(float(fch.get("sl_mult_hint") or 0.0))
             side_hints.append(float(fch.get("side_hint") or 0.0))
             sigs.append(float(fc.get("timesfm_signal") or 0.0))
+            levOrd = (r.get('open_orders')[0]).get('Lev') if len(r.get('open_orders') or []) > 0 else 0
+            limit =  (r.get('pair_limits')).get('ordermin') or 0
+            levOpenOrders.append(levOrd)
+            minOrder.append(limit)
 
         # rendili disponibili al decoder (dimensione B)
         aux = dict(aux or {})
@@ -1491,6 +1555,9 @@ class TRMAgent:
         aux["sl_mult_hint"] = sl_hints
         aux["side_hint"]    = side_hints
         aux["timesfm_sig"]  = sigs
+        aux["levOpenOrders"]  = levOpenOrders
+        aux["minOrder"]  = minOrder
+
         B = len(rows)
         base_cap = None
         try:
@@ -1537,8 +1604,10 @@ class TRMAgent:
             )
         else:
             yK = self.model.improve(X, y0=y0, K=K)
-
+        if pair == "FIL/EUR":
+            print('fil')
         actions = self.model.decode_actions(yK, aux)
+
         if act_stats is not None:
             for i, a in enumerate(actions):
                 a.notes = (a.notes or "") + f" | act_steps={int(act_stats['steps'][i])} | p_halt={float(act_stats['p_halt'][i]):.2f}"
