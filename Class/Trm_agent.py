@@ -23,6 +23,8 @@ from .Util import _shadow_daily_path, _net_margin_from_open_orders
 
 Number = Union[int, float]
 
+_EPS = 1e-9
+
 def _f(v: Any, default: float = 0.0) -> float:
     try:
         if v is None: return float(default)
@@ -40,6 +42,66 @@ def _b(v: Any, default: bool = False) -> bool:
     except Exception:
         return bool(default)
 
+
+# -----------------------------
+# Trade phase helpers
+# -----------------------------
+
+def infer_inventory_state(pos_base: float, pos_margin_base: float) -> str:
+    """Infer current inventory regime before taking a new action."""
+    try:
+        pos_base = float(pos_base or 0.0)
+    except Exception:
+        pos_base = 0.0
+    try:
+        pos_margin_base = float(pos_margin_base or 0.0)
+    except Exception:
+        pos_margin_base = 0.0
+
+    if pos_base > _EPS and pos_margin_base <= _EPS:
+        return "long_spot"
+    if pos_margin_base > _EPS:
+        return "long_margin"
+    if pos_margin_base < -_EPS:
+        return "short_open"
+    return "flat"
+
+
+def infer_trade_phase(side: str,
+                      reduce_only: bool,
+                      leverage: Optional[Number],
+                      pos_base: float,
+                      pos_margin_base: float) -> str:
+    """Infer the trade phase (entry/exit) for supervision and decoding."""
+    side = (side or "hold").lower()
+    lev = 0.0
+    try:
+        lev = float(leverage or 0.0)
+    except Exception:
+        lev = 0.0
+    inv = infer_inventory_state(pos_base, pos_margin_base)
+
+    if side == "hold":
+        return "hold"
+
+    if side == "buy":
+        # closing an open short either because reduce_only is flagged or inventory is short
+        if reduce_only or inv == "short_open":
+            return "close_short"
+        return "open_long"
+
+    if side == "sell":
+        # selling spot inventory / margin long counts as a close
+        if inv in ("long_spot", "long_margin") and not (lev > 1.0 and inv != "long_spot"):
+            return "close_long"
+        if lev > 1.0:
+            return "open_short"
+        # if we still have spot size assume partial close
+        if inv in ("long_spot", "long_margin"):
+            return "close_long"
+        return "open_short"
+
+    return "hold"
 
 # -----------------------------
 # Action dataclass
@@ -232,8 +294,8 @@ class AutoFeaturizer:
         free_base  = self._num(avail.get("base"))
 
         pos_margin_base = _net_margin_from_open_orders(row)
-       # --- regime derivati (robusti)
-       # EMA/ATR possono stare in info.NOW oppure in info.1H/info.4H a seconda del tuo loader: prendiamo le 2 strade
+        # --- regime derivati (robusti)
+        # EMA/ATR possono stare in info.NOW oppure in info.1H/info.4H a seconda del tuo loader: prendiamo le 2 strade
         ema50_1h  = self._num(((info.get("1H") or {}).get("EMA50") if isinstance(info.get("1H"), dict) else (now.get("ema50_1h"))))
         ema200_1h = self._num(((info.get("1H") or {}).get("EMA200") if isinstance(info.get("1H"), dict) else (now.get("ema200_1h"))))
         atr_4h    = self._num(((info.get("4H") or {}).get("atr")    if isinstance(info.get("4H"), dict) else (now.get("atr_4h"))))
@@ -290,6 +352,15 @@ class AutoFeaturizer:
 
         # pressione da posizione a margine (positiva long, negativa short)
         self._add(vec, "aux.pos_margin_base_tanh:num", math.tanh(pos_margin_base))
+
+        inv_state = infer_inventory_state(pos_base_qty, pos_margin_base)
+        self._add(vec, f"inventory.state:{inv_state}", 1.0)
+        if inv_state == "long_spot":
+            self._add(vec, "inventory.long_spot:num", math.log1p(max(pos_base_qty, 0.0)))
+        elif inv_state == "long_margin":
+            self._add(vec, "inventory.long_margin:num", math.log1p(max(pos_margin_base, 0.0)))
+        elif inv_state == "short_open":
+            self._add(vec, "inventory.short_open:num", math.log1p(max(-pos_margin_base, 0.0)))
 
         # policy di run/config
         self._add(vec, "aux.max_quote_frac:num", float(strategy_weights.get("max_quote_frac", 0.12)))
@@ -439,6 +510,7 @@ class Action:
     notes: Optional[str] = "TRM proposal"
     _side_prob: Optional[float] = None
     _entropy: Optional[float] = None
+    trade_phase: Optional[str] = None
 
     def as_dict(self, keep_none: bool = False) -> dict:
         d = asdict(self)            # non rimuove None
@@ -615,51 +687,48 @@ class TinyRecursiveModel(nn.Module):
         return y
 
 
+
     @torch.no_grad()
     def decode_actions(self, y: torch.Tensor, aux: Dict[str, List[Any]]) -> List[Action]:
         self.eval()
-        logits_side = self.head_side(y)                   # [B,3]
-        p_side = torch.softmax(logits_side, dim=-1)       # buy/sell/hold probs
-        qty_frac = torch.sigmoid(self.head_qty(y)).squeeze(-1)        # 0..1
-        px_off   = torch.tanh(self.head_px(y)).squeeze(-1) * 0.05     # ±5%
-        tp_mult  = F.softplus(self.head_tp(y)).squeeze(-1) * 0.01 # 0..
-        sl_mult  = F.softplus(self.head_sl(y)).squeeze(-1) * 0.01
-        tif_idx  = torch.argmax(self.head_tif(y), dim=-1)
-        lev      = F.softplus(self.head_lev(y)).squeeze(-1) + 1.0
-        score    = torch.tanh(self.head_score(y)).squeeze(-1)
-        ord_logits = self.head_ordertype(y)                 # [B,2]
-        ord_idx    = torch.argmax(ord_logits, dim=-1)       # 0=limit, 1=market
-        p_reduce   = torch.sigmoid(self.head_reduce(y)).squeeze(-1)  # 0..1
+        logits_side = self.head_side(y)
+        p_side = torch.softmax(logits_side, dim=-1)
+        qty_frac = torch.sigmoid(self.head_qty(y)).squeeze(-1)
+        px_off = torch.tanh(self.head_px(y)).squeeze(-1) * 0.05
+        tp_mult = F.softplus(self.head_tp(y)).squeeze(-1) * 0.01
+        sl_mult = F.softplus(self.head_sl(y)).squeeze(-1) * 0.01
+        tif_idx = torch.argmax(self.head_tif(y), dim=-1)
+        lev = F.softplus(self.head_lev(y)).squeeze(-1) + 1.0
+        score = torch.tanh(self.head_score(y)).squeeze(-1)
+        ord_logits = self.head_ordertype(y)
+        ord_idx = torch.argmax(ord_logits, dim=-1)
+        p_reduce = torch.sigmoid(self.head_reduce(y)).squeeze(-1)
 
         actions: List[Action] = []
         B = y.shape[0]
         for i in range(B):
             pair = aux["pair"][i]
-            mid  = _f(aux["mid"][i], 0.0)
-            bid  = _f(aux["bid"][i], mid)
-            ask  = _f(aux["ask"][i], mid)
-            lot_dec   = int(aux["lot_decimals"][i])
-            pair_dec  = int(aux["pair_decimals"][i])
-            ordermin  = _f(aux["ordermin"][i], 0.0)
-            free_quote= _f(aux["free_quote"][i], 0.0)
+            mid = _f(aux["mid"][i], 0.0)
+            bid = _f(aux["bid"][i], mid)
+            ask = _f(aux["ask"][i], mid)
+            lot_dec = int(aux["lot_decimals"][i])
+            pair_dec = int(aux["pair_decimals"][i])
+            ordermin = _f(aux["ordermin"][i], 0.0)
+            free_quote = _f(aux["free_quote"][i], 0.0)
             free_base = _f(aux["free_base"][i], 0.0)
             max_qfrac = float(aux.get("max_quote_frac", [0.12])[i] if isinstance(aux.get("max_quote_frac"), list) else aux.get("max_quote_frac", 0.12))
             min_notional = float(aux.get("min_notional_eur", [5.0])[i] if isinstance(aux.get("min_notional_eur"), list) else aux.get("min_notional_eur", 5.0))
 
-            # --- leggi hints ---
             tp_hint = float((aux.get("tp_mult_hint") or [0.0])[i])
             sl_hint = float((aux.get("sl_mult_hint") or [0.0])[i])
-            sh      = float((aux.get("side_hint") or [0.0])[i])
-            tfs     = float((aux.get("timesfm_sig") or [0.0])[i])
-            # 2) TP/SL: blend predizione rete con hint (peso da conf)
-            hint_weight = min(1.0, max(0.0, abs(tfs)))  # usa il segnale timesfm come proxy conf
+            tfs = float((aux.get("timesfm_sig") or [0.0])[i])
+            hint_weight = min(1.0, max(0.0, abs(tfs)))
             tp_eff = float(tp_mult[i].item()) * 0.5 + tp_hint * 0.5 * hint_weight
             sl_eff = float(sl_mult[i].item()) * 0.5 + sl_hint * 0.5 * hint_weight
 
-            side_idx = int(torch.argmax(p_side[i]).item())   # 0=buy, 1=sell, 2=hold
+            side_idx = int(torch.argmax(p_side[i]).item())
             p_hat = float(p_side[i, side_idx].item())
-            H = float((-(p_side[i] * torch.log(p_side[i] + 1e-12)).sum()).item())  # entropia
-
+            H = float((-(p_side[i] * torch.log(p_side[i] + 1e-12)).sum()).item())
             is_buy = (side_idx == 0)
             side = "buy" if is_buy else "sell"
 
@@ -669,131 +738,153 @@ class TinyRecursiveModel(nn.Module):
             px = round(px, pair_dec)
 
             if side_idx == 2:
-                # --- HOLD: nessun ordine, qty 0, nessun TP/SL ---
                 actions.append(Action(
                     pair=pair, side="hold", qty=0.0, price=px,
                     ordertype="none", take_profit=None, stop_loss=None,
-                    leverage=None, time_in_force="GTC", score=float(score[i].item()), _side_prob = p_hat, _entropy = H
+                    leverage=None, time_in_force="GTC",
+                    score=float(score[i].item()), _side_prob=p_hat, _entropy=H,
+                    notes="trade_phase=hold", trade_phase="hold"
                 ))
-            else:
-                # TP/SL direzionati
-                # poi usa tp_eff/sl_eff invece di tp_mult[i]/sl_mult[i] nella costruzione dei livelli:
-                tp = px * (1.0 + (tp_eff if is_buy else -tp_eff))
-                sl = px * (1.0 - (sl_eff if is_buy else -sl_eff))
-                tp = round(tp, pair_dec); sl = round(sl, pair_dec)
+                continue
 
-                # size & vincoli (BUDGET-AWARE ma minimale: preserva il resto)
-                frac = max(min(float(qty_frac[i].item()), max_qfrac), 0.02)
+            tp = px * (1.0 + (tp_eff if is_buy else -tp_eff))
+            sl = px * (1.0 - (sl_eff if is_buy else -sl_eff))
+            tp = round(tp, pair_dec)
+            sl = round(sl, pair_dec)
 
-                # --- cap globale opzionale (se passato da propose_actions_for_batch) ---
-                rb = None
-                rl = 0
+            frac = max(min(float(qty_frac[i].item()), max_qfrac), 0.02)
+
+            rb = None
+            rl = 0
+            try:
+                rb = float((aux.get("run_budget_quote") or [None])[i]) if ("run_budget_quote" in aux) else None
+                rl = int((aux.get("run_currencies_left") or [0])[i]) if ("run_currencies_left" in aux) else 0
+            except Exception:
+                rb, rl = None, 0
+
+            reserve_frac = float((aux.get("reserve_frac", [self.cfg.reserve_frac])[i] if isinstance(aux.get("reserve_frac"), list) else aux.get("reserve_frac", self.cfg.reserve_frac)))
+            super_sc = float((aux.get("super_conf_score", [self.cfg.super_conf_score])[i] if isinstance(aux.get("super_conf_score"), list) else aux.get("super_conf_score", self.cfg.super_conf_score)))
+            super_p = float((aux.get("super_conf_sideprob", [self.cfg.super_conf_sideprob])[i] if isinstance(aux.get("super_conf_sideprob"), list) else aux.get("super_conf_sideprob", self.cfg.super_conf_sideprob)))
+
+            pos_base = _f((aux.get("pos_base") or [0.0])[i], 0.0)
+            pos_m = _f(aux["pos_margin_base"][i], 0.0)
+            long_exposure = max(pos_base, 0.0) + max(pos_m, 0.0)
+            short_exposure = max(-pos_m, 0.0)
+
+            lev_raw = max(float(lev[i].item()), 0.0)
+            sc = float(score[i].item())
+            lev_max_allowed = int(aux["lev_buy_max"][i]) if is_buy else int(aux["lev_sell_max"][i])
+            lev_out = None
+            if lev_max_allowed > 1 and lev_raw > 1.0 and sc >= 0.35:
+                lev_out = float(min(lev_raw, float(lev_max_allowed)))
+
+            cap_hint = None
+            if "cap_eur_hint" in aux and i < len(aux["cap_eur_hint"]):
                 try:
-                    # run_budget_quote/run_currencies_left sono replicati per ogni riga dal tuo TRMAgent
-                    # (vedi propose_actions_for_batch che li mette in aux). :contentReference[oaicite:0]{index=0}
-                    rb = float((aux.get("run_budget_quote") or [None])[i]) if ("run_budget_quote" in aux) else None
-                    rl = int((aux.get("run_currencies_left") or [0])[i]) if ("run_currencies_left" in aux) else 0
+                    cap_hint = float(aux["cap_eur_hint"][i])
                 except Exception:
-                    rb, rl = None, 0
+                    cap_hint = None
 
-                # knobs (con fallback alla cfg)
-                reserve_frac = float((aux.get("reserve_frac", [self.cfg.reserve_frac])[i] if isinstance(aux.get("reserve_frac"), list) else aux.get("reserve_frac", self.cfg.reserve_frac)))
-                super_sc = float((aux.get("super_conf_score", [self.cfg.super_conf_score])[i] if isinstance(aux.get("super_conf_score"), list)else aux.get("super_conf_score", self.cfg.super_conf_score)))
-                super_p = float((aux.get("super_conf_sideprob", [self.cfg.super_conf_sideprob])[i] if isinstance(aux.get("super_conf_sideprob"), list)else aux.get("super_conf_sideprob", self.cfg.super_conf_sideprob)))
+            if cap_hint is None and rb is not None:
+                budget_after_res = max(0.0, float(rb)) * max(0.0, 1.0 - float(reserve_frac))
+                denom = float(max(1, int(rl) or 1))
+                cap_hint = budget_after_res / denom
 
-                # 1) cap suggerito per-pair: equal-share sul budget residuo (al netto della riserva)
-                cap_hint = None
-                # se un piano esterno ti ha messo 'cap_eur_hint' per questa riga, usalo
-                if "cap_eur_hint" in aux and i < len(aux["cap_eur_hint"]):
-                    try:
-                        cap_hint = float(aux["cap_eur_hint"][i])
-                    except Exception:
-                        cap_hint = None
+            if cap_hint is not None:
+                cap_hint = max(cap_hint, min_notional)
 
-                if cap_hint is None and rb is not None:
-                    budget_after_res = max(0.0, float(rb)) * max(0.0, 1.0 - float(reserve_frac))
-                    denom = float(max(1, int(rl) or 1))   # ATTENZIONE: qui rl è "quante currency restano" a livello RUN
-                    cap_hint = budget_after_res / denom
+            cap_eur = cap_hint if (cap_hint is not None) else float("inf")
+            p_hat_exec = float(torch.max(p_side[i, 0], p_side[i, 1]).item())
+            is_super = (abs(float(score[i].item())) >= super_sc) and (p_hat_exec >= super_p)
+            if is_super and (rb is not None):
+                cap_eur = min(float(cap_eur) * 3.0, float(rb))
 
-                # 2) se segnale è super convinto, consenti un piccolo boost ma mai oltre il budget residuo
-                p_hat = float(torch.max(p_side[i, 0], p_side[i, 1]).item())
-                is_super = (abs(float(score[i].item())) >= super_sc) and (p_hat >= super_p)
+            reduce_only = bool(p_reduce[i].item() >= 0.5)
+            trade_phase = infer_trade_phase(side, reduce_only, lev_out or lev_raw, pos_base, pos_m)
 
-                cap_eur = cap_hint if (cap_hint is not None) else float('inf')
-                if is_super and (rb is not None):
-                    cap_eur = min(float(cap_eur) * 3.0, float(rb))
+            if trade_phase == "open_long" and free_quote <= 0.0:
+                trade_phase = "hold"
+            if trade_phase == "open_short" and free_quote <= 0.0:
+                trade_phase = "hold"
 
-                # 3) cap finale: per BUY prendi il min tra cassa locale e cap globale; per SELL non cappiamo la spesa (usa free_base)
-                notional_cap = float(free_quote)
-                if is_buy and (cap_eur != float('inf')):
-                    notional_cap = min(float(free_quote), float(cap_eur))
-
-                # notional come prima (manteniamo tutte le tue invarianti di prezzo/TP/SL/TIF)
-                notional = notional_cap * frac
-
-
-                # qty
-                qty = (notional / px) if px > 0 else 0.0
-                if not is_buy and free_base > 0:
-                    qty = min(qty if qty > 0 else free_base, free_base)
-                qty = round(qty, lot_dec)
-
-                # se non raggiungi i minimi exchange -> HOLD
-                if (qty <= 0.0) or (notional < min_notional):
-                    actions.append(Action(
-                        pair=pair, side="hold", qty=0.0, price=px,
-                        ordertype="none", take_profit=tp, stop_loss=None,
-                        leverage=None, time_in_force="GTC", score=float(score[i].item()), _side_prob = p_hat, _entropy = H
-                    ))
-                    continue
-
-
-                # ---- ordertype ----
-                oi = int(ord_idx[i].item())           # 0=limit, 1=market
-                ordertype = "market" if oi == 1 else "limit"
-                # per i market non forziamo il prezzo; lascia None o mid:
-                price_out = px
-                # TIF: per market usa IOC, altrimenti mappa come prima
-                tif_map = {0:"IOC", 1:"FOK", 2:"GTC"}
-                tif_out = "IOC" if ordertype == "market" else tif_map.get(int(tif_idx[i].item()), "GTC")
-
-                # ---- reduce_only ----
-                # regola gestionale: se stiamo vendendo con leva >= 2, forza reduce_only per evitare aperture short non desiderate
-                # ---- reduce_only con gate sulla posizione a leva ----
-                reduce_pred = bool(p_reduce[i].item() >= 0.5)
-                pos_m = _f(aux["pos_margin_base"][i], 0.0)
-
-                is_sell = (side_idx == 1)
-
-                # stai riducendo una posizione a leva solo se:
-                # - hai long>0 e vendi, oppure short<0 e compri
-                is_reducing_lev = (pos_m > 0 and is_sell) or (pos_m < 0 and is_buy)
-
-                reduce_only = bool(reduce_pred and is_reducing_lev)
-                lev_raw = float(lev[i].item())
-                sc = float(score[i].item())
-                lev_out = (lev_raw if (sc >= 0.6 and lev_raw > 1.0) else None)
-
-                # blocca o clippa la leva se la coppia non la supporta
-                lev_max_allowed = int(aux["lev_buy_max"][i]) if is_buy else int(aux["lev_sell_max"][i])
-                if lev_max_allowed <= 1:
+            if trade_phase == "close_short":
+                reduce_only = True
+                lev_out = None
+            elif trade_phase == "close_long":
+                if pos_m > _EPS:
+                    reduce_only = True
+                if reduce_only:
                     lev_out = None
-                elif lev_out is not None and lev_out > lev_max_allowed:
-                    lev_out = float(lev_max_allowed)
+            elif trade_phase == "open_short":
+                if lev_out is None and lev_max_allowed > 1 and lev_raw > 1.0:
+                    lev_out = float(min(lev_raw, float(lev_max_allowed)))
+                if lev_max_allowed <= 1 or lev_out is None or lev_out <= 1.0:
+                    trade_phase = "hold"
+            else:
+                if is_buy:
+                    lev_out = None
 
+            if trade_phase == "hold":
                 actions.append(Action(
-                    pair=pair, side=side, qty=qty, price=price_out,
-                    ordertype=ordertype,
-                    take_profit=tp,  # opzionale: su market spesso gestisci TP/SL a parte
-                    leverage=lev_out,
-                    stop_loss=sl,
-                    # leverage=float(lev[i].item()),
-                    time_in_force=tif_out,
-                    reduce_only=reduce_only,
-                    score=float(score[i].item()),
-                    _side_prob = p_hat, _entropy = H
+                    pair=pair, side="hold", qty=0.0, price=px,
+                    ordertype="none", take_profit=tp, stop_loss=None,
+                    leverage=None, time_in_force="GTC", score=float(score[i].item()),
+                    _side_prob=p_hat, _entropy=H, notes="trade_phase=hold", trade_phase="hold"
                 ))
+                continue
 
+            if trade_phase == "open_long":
+                notional_cap = float(free_quote)
+                if cap_eur != float("inf"):
+                    notional_cap = min(float(free_quote), float(cap_eur))
+                notional = notional_cap * frac
+                qty = (notional / px) if px > 0 else 0.0
+            elif trade_phase == "open_short":
+                margin_cap = float(free_quote)
+                if cap_eur != float("inf"):
+                    margin_cap = min(float(margin_cap), float(cap_eur))
+                notional = margin_cap * max(lev_out or 1.0, 1.0) * frac
+                qty = (notional / px) if px > 0 else 0.0
+            elif trade_phase == "close_long":
+                base_available = max(long_exposure, 0.0)
+                qty = base_available * frac
+                notional = qty * px
+            else:
+                short_available = max(short_exposure, 0.0)
+                qty = short_available * frac
+                notional = qty * px
+
+            qty = round(qty, lot_dec)
+            notional = float(notional)
+
+            if trade_phase in ("close_long", "close_short") and qty <= 0.0:
+                qty = round((long_exposure if trade_phase == "close_long" else short_exposure), lot_dec)
+                notional = qty * px
+
+            if qty <= 0.0 or (trade_phase in ("open_long", "open_short") and notional < min_notional):
+                actions.append(Action(
+                    pair=pair, side="hold", qty=0.0, price=px,
+                    ordertype="none", take_profit=tp, stop_loss=None,
+                    leverage=None, time_in_force="GTC", score=float(score[i].item()),
+                    _side_prob=p_hat, _entropy=H, notes="trade_phase=hold_min", trade_phase="hold"
+                ))
+                continue
+
+            oi = int(ord_idx[i].item())
+            ordertype = "market" if oi == 1 else "limit"
+            price_out = px
+            tif_map = {0: "IOC", 1: "FOK", 2: "GTC"}
+            tif_out = "IOC" if ordertype == "market" else tif_map.get(int(tif_idx[i].item()), "GTC")
+
+            note = f"trade_phase={trade_phase}"
+            actions.append(Action(
+                pair=pair, side=side, qty=qty, price=price_out,
+                ordertype=ordertype, take_profit=tp,
+                leverage=lev_out, stop_loss=sl,
+                time_in_force=tif_out, reduce_only=reduce_only,
+                score=float(score[i].item()), notes=note, trade_phase=trade_phase,
+                _side_prob=p_hat, _entropy=H
+            ))
 
         return actions
 
@@ -899,9 +990,11 @@ def featurize_one(row: Dict[str,Any], blend: Dict[str,Number], goal_state: Optio
             pend, urg, nd, nw, *bvec, *wvec]
     pair = row.get("pair") or f"{row.get('base','?')}/{row.get('quote','?')}"
     pl = row.get("pair_limits") or {}
+    pos_margin_base = _net_margin_from_open_orders(row)
     aux = {"pair":[pair], "mid":[nowf["mid"]], "bid":[nowf["bid"]], "ask":[nowf["ask"]],
            "lot_decimals":[int(pl.get("lot_decimals") or 8)], "pair_decimals":[int(pl.get("pair_decimals") or 5)],
            "ordermin":[pl.get("ordermin") or 0.0], "free_quote":[pf["free_quote"]], "free_base":[pf["free_base"]],
+           "pos_margin_base":[pos_margin_base], "pos_base":[pf["pos_base"]],
            "max_quote_frac":[strategy_weights.get("max_quote_frac",0.12)], "min_notional_eur":[strategy_weights.get("min_notional_eur",5.0)]}
     return flat, aux
 
@@ -914,7 +1007,7 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
     if USE_HASH_FEATS:
         X = []
         aux = {k:[] for k in ["pair","mid","bid","ask","lot_decimals","pair_decimals",
-                               "ordermin","free_quote","free_base","pos_margin_base",
+                               "ordermin","free_quote","free_base","pos_margin_base","pos_base",
                                "slippage_in","slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur","lev_buy_max","lev_sell_max"]}
         for row, blend in zip(rows, blends):
             v, a = _auto_feat.featurize(row, blend, goal_state, strategy_weights)
@@ -963,13 +1056,22 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
                                 _auto_feat._add(v, "mem.tp_hit_now:bool", hit)
                         except Exception:
                             pass
+                        try:
+                            entry = float(mcur.get("last_entry_price") or 0.0)
+                            if mid_now > 0 and entry > 0:
+                                unrealized = (mid_now - entry) / entry
+                                _auto_feat._add(v, "mem.unrealized_pct:num", unrealized)
+                                direction = str(mcur.get("last_side") or "").lower()
+                                _auto_feat._add(v, f"mem.last_cycle:{direction}", 1.0)
+                        except Exception:
+                            pass
             X.append(v)
             for k in aux.keys(): aux[k].extend(a[k])
         X_t = torch.tensor(X, dtype=torch.float32)
         return X_t, aux
     else:
         # fallback alle features hardcoded esistenti
-        X = []; aux = {k:[] for k in ["pair","mid","bid","ask","lot_decimals","pair_decimals","ordermin","free_quote","free_base","pos_margin_base","slippage_in","slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur"]}
+        X = []; aux = {k:[] for k in ["pair","mid","bid","ask","lot_decimals","pair_decimals","ordermin","free_quote","free_base","pos_margin_base","pos_base","slippage_in","slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur"]}
         for row, blend in zip(rows, blends):
             flat, a = featurize_one(row, blend, goal_state, strategy_weights)
             X.append(flat)
@@ -1021,7 +1123,7 @@ class TRMAgent:
             # default_ckpt = os.path.join(os.getcwd(), "aiConfig", "trm_from_paired.ckpt")
             # self.load_brain(default_ckpt)  # se non esiste, stampa un warning e continua
             ckpt_path = self.cfg.__dict__.get("ckpt_path") \
-                    or os.path.join(os.getcwd(), "aiConfig", "trm_from_paired.ckpt")
+                    or os.path.join(os.getcwd(), "aiConfig", "trm_from_paired_full.ckpt")
             self._safe_load_ckpt(ckpt_path)
         except Exception:
             pass
@@ -1275,10 +1377,11 @@ class TRMAgent:
                 # spendo budget solo per i BUY (qty*prezzo)
                 spent = 0.0
                 for a in final:
-                    if a.side == "buy" and a.price is not None and a.reduce_only != True:
+                    if a.price is None:
+                        continue
+                    if getattr(a, "trade_phase", None) == "open_long" and a.side == "buy" and not a.reduce_only:
                         spent += float(a.qty) * float(a.price)
-
-                    if a.side == "sell" and a.leverage is not None:
+                    elif getattr(a, "trade_phase", None) == "open_short" and a.leverage is not None:
                         spent += float(a.qty) * float(a.price)
 
                 if self.cfg.total_budget_quote is not None:

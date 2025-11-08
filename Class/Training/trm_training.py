@@ -10,7 +10,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 # Importa dal tuo agente TRM esistente
-from ..Trm_agent import TRMAgent, featurize_batch, TinyRecursiveModel, TRMConfig # :contentReference[oaicite:0]{index=0}
+from ..Trm_agent import (
+    TRMAgent,
+    featurize_batch,
+    TinyRecursiveModel,
+    TRMConfig,
+    infer_trade_phase,
+)
 from ..Trm_agent import Action  # solo per typing
 from ..Util import _shadow_daily_path  # helper giornaliero
 import torch.nn.functional as F
@@ -51,6 +57,46 @@ def _sigmoid(x: float) -> float:
     except OverflowError:
         return 0.0 if x < 0 else 1.0
 
+
+def _parse_ts(val: Any) -> _dt.datetime:
+    if isinstance(val, _dt.datetime):
+        return val
+    if not val:
+        return _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+    txt = str(val)
+    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            if fmt:
+                dt = _dt.datetime.strptime(txt, fmt)
+            else:
+                dt = _dt.datetime.fromisoformat(txt.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return dt
+        except Exception:
+            continue
+    return _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+
+
+def _to_float(val: Any, default: float = 0.0) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return float(default)
+
+
+def _to_bool(val: Any, default: bool = False) -> bool:
+    if isinstance(val, bool):
+        return val
+    try:
+        if str(val).lower() in {"true", "1", "yes"}:
+            return True
+        if str(val).lower() in {"false", "0", "no", "none"}:
+            return False
+    except Exception:
+        pass
+    return bool(default)
+
 # -----------------------------
 # Dataset dai shadow_actions
 # -----------------------------
@@ -64,6 +110,7 @@ class Sample:
     pnl: Optional[float]             # per reinforcement-like
     decision_id: Optional[str]       # per assisted override
     pair: str
+    trade_phase: str
 
 class ShadowActionsDataset(torch.utils.data.Dataset):
     """
@@ -90,15 +137,19 @@ class ShadowActionsDataset(torch.utils.data.Dataset):
             paths = sorted(glob.glob(os.path.join(base_dir, "shadow_actions_*.jsonl")))
 
         # indicizza per decision_id per agganciare pnl post-operazione
-        # prima passata: raccogli decisions
         decisions: Dict[str, Dict[str, Any]] = {}
+        ordered_decisions: List[Tuple[_dt.datetime, Dict[str, Any]]] = []
         for p in paths:
             for r in _read_jsonl(p):
                 if (r.get("event_type") or r.get("eventType")) == "decision":
                     did = str(r.get("decision_id") or r.get("_decision_id") or "")
                     if not did:
                         continue
-                    decisions[did] = r
+                    dt = _parse_ts(r.get("ts") or r.get("timestamp") or r.get("time"))
+                    row = dict(r)
+                    row["_parsed_ts"] = dt
+                    decisions[did] = row
+                    ordered_decisions.append((dt, row))
 
         # seconda passata: attacca pnl dove presente
         did2pnl: Dict[str, float] = {}
@@ -112,8 +163,12 @@ class ShadowActionsDataset(torch.utils.data.Dataset):
                         except Exception:
                             continue
 
+        ordered_decisions.sort(key=lambda t: t[0])
+        open_cycles: Dict[Tuple[str, str], int] = {}
+
         # costruisci samples
-        for did, dec in decisions.items():
+        for _, dec in ordered_decisions:
+            did = str(dec.get("decision_id") or dec.get("_decision_id") or "")
             pair = dec.get("pair") or ((dec.get("action") or {}).get("pair"))
             if not pair:
                 continue
@@ -142,6 +197,7 @@ class ShadowActionsDataset(torch.utils.data.Dataset):
                         "qty": pf.get("pos_base"),
                         "px_EUR": None,
                         "pnl_pct": pf.get("pnl_pct"),
+                        "pos_margin_base": pf.get("pos_margin_base") or derived.get("pos_margin_base"),
                     },
                     "available": {
                         "base": pf.get("free_base"),
@@ -155,16 +211,30 @@ class ShadowActionsDataset(torch.utils.data.Dataset):
             weights = dec.get("weights") or {}
             goal_state = dec.get("goal_state") or {}
 
-            # target supervision: dall'azione loggata o da assisted override
             target = (assisted_overrides.get(did) or (dec.get("action") or {})).copy()
             target["side"] = (str(target.get("side") or target.get("tipo") or "hold")).lower()
             target["ordertype"] = (str(target.get("ordertype") or target.get("quando") or "limit")).lower()
             if target["ordertype"] == "hold":
                 target["ordertype"] = "none"
 
+            target["reduce_only"] = _to_bool(target.get("reduce_only") or target.get("reduce") or target.get("reduceOnly"))
+            target["leverage"] = _to_float(target.get("leverage") or 0.0)
+
+            pos_base_val = _to_float(pf.get("pos_base") or pf.get("qty"))
+            pos_margin_val = _to_float(pf.get("pos_margin_base") or derived.get("pos_margin_base") or 0.0)
+
+            trade_phase = infer_trade_phase(
+                target["side"],
+                target["reduce_only"],
+                target["leverage"],
+                pos_base_val,
+                pos_margin_val,
+            )
+
+            target["trade_phase"] = trade_phase
             pnl = did2pnl.get(did)
 
-            self.samples.append(Sample(
+            sample = Sample(
                 x_row=row_like,
                 blend=blend,
                 goal_state=goal_state,
@@ -172,8 +242,26 @@ class ShadowActionsDataset(torch.utils.data.Dataset):
                 target=target,
                 pnl=pnl,
                 decision_id=did,
-                pair=pair
-            ))
+                pair=pair,
+                trade_phase=trade_phase
+            )
+            self.samples.append(sample)
+
+            idx = len(self.samples) - 1
+            cycle_key = (pair, "long" if trade_phase in ("open_long", "close_long") else "short")
+            if trade_phase == "open_long":
+                open_cycles[cycle_key] = idx
+            elif trade_phase == "open_short":
+                open_cycles[cycle_key] = idx
+            elif trade_phase == "close_long":
+                entry_idx = open_cycles.pop(cycle_key, None)
+                if entry_idx is not None and pnl is not None:
+                    self.samples[entry_idx].pnl = pnl
+            elif trade_phase == "close_short":
+                entry_idx = open_cycles.pop(cycle_key, None)
+                if entry_idx is not None and pnl is not None:
+                    self.samples[entry_idx].pnl = pnl
+
             if max_samples and len(self.samples) >= max_samples:
                 break
 
@@ -198,6 +286,23 @@ class PairedJsonlDataset(torch.utils.data.Dataset):
             if target["ordertype"] == "hold":
                 target["ordertype"] = "none"
 
+            target["reduce_only"] = _to_bool(target.get("reduce_only") or target.get("reduce") or target.get("reduceOnly"))
+            target["leverage"] = _to_float(target.get("leverage") or 0.0)
+
+            row_port = (x_row.get("portfolio") or {}).get("row") or {}
+            pos_base_val = _to_float(row_port.get("qty"))
+            pos_margin_val = _to_float(row_port.get("pos_margin_base") or 0.0)
+
+            trade_phase = infer_trade_phase(
+                target["side"],
+                target["reduce_only"],
+                target["leverage"],
+                pos_base_val,
+                pos_margin_val,
+            )
+
+            target["trade_phase"] = trade_phase
+
             pnl = r.get("pnl")
             decision_id = r.get("decision_id")
             order_id = r.get("order_id") or r.get("orderId")
@@ -213,7 +318,8 @@ class PairedJsonlDataset(torch.utils.data.Dataset):
                 target=target,
                 pnl=(float(pnl) if pnl is not None else None),
                 decision_id=decision_id,
-                pair=pair
+                pair=pair,
+                trade_phase=trade_phase
             ))
             if max_samples and len(self.samples) >= max_samples:
                 break
@@ -389,6 +495,9 @@ class TRMTrainer:
         p_hold = p_side[:, 2]                                 # [B]
         p_exec = (1.0 - p_hold).view(-1)
 
+        notional = max(abs(float(x_aux.get("mid",[0])[0] or 0.0) *
+                        float((x_aux.get("qty") or [0])[0] or 0.0)), 1.0)
+        edge = ((pnl - cost_eur) / notional).clamp(-0.05, 0.05)
         return reduces * torch.relu(float(margin) - edge) * p_exec
 
     def _estimate_side_class_weights(self, dataset) -> torch.Tensor:
@@ -411,12 +520,28 @@ class TRMTrainer:
         pos_base  = float((x_aux.get("pos_base") or [0.0])[0])
         price = float(target.get("price") or x_aux.get("mid",[0.0])[0] or 0.0)
         qty = float(target.get("qty") or target.get("quantita") or 0.0)
+        pos_m = float(x_aux.get("pos_margin_base", [0.0])[0] or 0.0)
+        leverage = float(target.get("leverage") or 0.0)
+        trade_phase = str(target.get("trade_phase") or "hold")
+
+        long_exposure = max(pos_base + max(pos_m, 0.0), 0.0)
+        short_exposure = max(-pos_m, 0.0)
 
         if side_idx == 0:  # BUY
-            notional = qty * price if (qty and price) else 0.0
-            qty_frac = 0.0 if free_quote <= 0 else min(max(notional / max(free_quote, 1e-9), 0.0), 1.0)
+            if trade_phase == "close_short" and short_exposure > 0:
+                qty_frac = min(max(qty / max(short_exposure, 1e-9), 0.0), 1.0)
+            else:
+                notional = qty * price if (qty and price) else 0.0
+                qty_frac = 0.0 if free_quote <= 0 else min(max(notional / max(free_quote, 1e-9), 0.0), 1.0)
         elif side_idx == 1:  # SELL
-            qty_frac = 0.0 if pos_base <= 0 else min(max(qty / max(pos_base, 1e-9), 0.0), 1.0)
+            if trade_phase == "close_long" and long_exposure > 0:
+                qty_frac = min(max(qty / max(long_exposure, 1e-9), 0.0), 1.0)
+            elif trade_phase == "open_short":
+                notional = qty * price if (qty and price) else 0.0
+                margin_cap = free_quote * max(leverage, 1.0)
+                qty_frac = 0.0 if margin_cap <= 0 else min(max(notional / max(margin_cap, 1e-9), 0.0), 1.0)
+            else:
+                qty_frac = 0.0 if pos_base <= 0 else min(max(qty / max(pos_base, 1e-9), 0.0), 1.0)
         else:
             qty_frac = 0.0
 
@@ -430,12 +555,7 @@ class TRMTrainer:
         tif_map = {"ioc":0, "fok":1, "gtc":2}
         tif = tif_map.get(str(target.get("time_in_force") or target.get("tif") or "gtc").lower(), 2)
 
-        pos_m = float(x_aux.get("pos_margin_base", [0.0])[0] or 0.0)
-        reduces = 0.0
-        if side_idx == 1 and pos_m > 0:
-            reduces = 1.0
-        if side_idx == 0 and pos_m < 0:
-            reduces = 1.0
+        reduces = 1.0 if trade_phase in ("close_long", "close_short") else 0.0
 
         return {
             "side": torch.tensor([side_idx], dtype=torch.long, device=self.device),
@@ -507,7 +627,7 @@ class TRMTrainer:
                 # pesi iniziali (tunable)
                 lam_budget = 0.50
                 lam_market = 0.25
-                lam_cycle  = 0.50
+                lam_cycle  = 0.01
                 return (loss_side + 0.5*ce_ord + 0.25*ce_tif + 0.5*l_qty + 0.5*l_px + 0.25*b_reduce
                         + lam_budget*loss_budget.mean()
                         + lam_market*loss_market.mean()
@@ -604,7 +724,7 @@ class TRMTrainer:
             y0 = self.model.y0_proj(Xn).detach()
             if getattr(self.agent.cfg, "act_enabled", False):
                 # allineato a propose_actions_for_batch (runtime)
-                print('dentro')
+                # print('dentro')
                 yK, _ = self.model.improve_adaptive(
                     X, y0=y0,
                     max_steps=int(self.agent.cfg.K_refine),
@@ -935,3 +1055,4 @@ if __name__ == "__main__":
 # python -m Class.Training.trm_training --paired_file ".\storico_output\trm_log\training\trm_paired_dataset_20251030_192606.jsonl" --device cpu --epochs 8 --batch_size 32 --lr 1e-3 --val_frac 0.2 --save ".\aiConfig\trm_from_paired.ckpt"
 
 # python -m Class.Training.trm_training --log_path ".\storico_output\trm_log\shadow_actions.jsonl" --device cpu --epochs 8 --batch_size 32 --lr 1e-3 --val_frac 0.2 --save ".\aiConfig\trm_from_shadow.ckpt" --mode supervised --hold_max_frac 1.0
+# python -m Class.Training.trm_training --paired_file "storico_output/trm_log/training/trm_paired_dataset_synthetic_levels_20251107_175144.jsonl" --device cpu --epochs 8 --batch_size 48 --lr 5e-4 --mode supervised --save "aiConfig/trm_from_paired_full.ckpt"
