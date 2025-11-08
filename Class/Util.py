@@ -147,12 +147,33 @@ def _pnl_from_trades(trades: list[dict]) -> float | None:
 def reconcile_shadow_with_query_orders(log_path: str, kraken, sleep_s: float = 0.0) -> int:
     """
     Per ogni record con order_id:
-      - QueryOrders(txid, trades=true)
-      - trade_ids = closetxid (se presenti) altrimenti trades (riempimenti dell'ordine)
-      - QueryTrades per quei trade_ids
-      - pnl = Σ(cost sell) − Σ(cost buy) − Σ(fee)
-      - aggiorna record con: pnl (float), closedIds (lista di trade-id)
+        - QueryOrders(txid, trades=true)
+        - Se l’ordine CHIUDE (determinazione per stato o closetxid), aggiorna il record
+        - PnL viene calcolato **solo** quando Kraken fornisce i leg di apertura (closetxid).
+        In assenza di closetxid ma con close inferita da stato → marca `is_closure=True` senza `pnl`.
     """
+    def _pos_before_from_record(rec: dict) -> float:
+        """Estrae una posizione firmata 'prima' dell’ordine provando più sorgenti note del progetto."""
+        cand = []
+        try: cand.append(float(rec.get("pos_base")))
+        except Exception: pass
+        try: cand.append(float(((rec.get("portfolio") or {}).get("qty")) or 0.0))
+        except Exception: pass
+        try:
+            aux = rec.get("aux") or rec.get("run_aux") or {}
+            v = (aux.get("pos_base") or [None])[0]
+            if v is None:  # fallback storico
+                v = (aux.get("pos_margin_base") or [0.0])[0]
+            cand.append(float(v or 0.0))
+        except Exception: pass
+        for v in cand:
+            try:
+                if v is not None and math.isfinite(v):
+                    return float(v)
+            except Exception:
+                continue
+        return 0.0
+
     now = _dt.datetime.now()
     daily_log_path = _shadow_daily_path(log_path, now)
     rows = _jsonl_read_all(daily_log_path)
@@ -169,31 +190,38 @@ def reconcile_shadow_with_query_orders(log_path: str, kraken, sleep_s: float = 0
             continue
 
         try:
-            o = _query_orders(kraken, oid)  # dict dell'ordine
-            # priorità: closetxid (trade-id che chiudono la posizione aperta da quest'ordine)
+            o = _query_orders(kraken, oid)  # ordine su Kraken
+            descr = (o.get("descr") or {})
+            side  = str(descr.get("type") or "").lower()        # 'buy' | 'sell'
+            own_trades = [str(t) for t in (o.get("trades") or []) if t]  # trade del CLOSE
+            # A) close certo con closetxid → calcola PnL aggregando open+close legs
             cx = o.get("closetxid")
+            close_refs = []
             if isinstance(cx, str) and cx:
-                trade_ids = [cx]
+                close_refs = [cx]
             elif isinstance(cx, list):
-                trade_ids = [str(t) for t in cx]
-            else:
-                # fallback: i trade generati da QUESTO ordine
-                tids = o.get("trades")
-                trade_ids = [str(t) for t in (tids or [])]
-
-            if not trade_ids:
+                close_refs = [str(t) for t in cx if t]
+            if close_refs:
+                trade_ids = list(dict.fromkeys(close_refs + own_trades))
+                trades = _query_trades_by_ids(kraken, trade_ids)
+                pnl = _pnl_from_trades(trades)
+                rec["pnl"] = pnl
+                rec["closedIds"] = close_refs
+                rec["executedIds"] = own_trades
+                rec["is_closure"] = True
+                rows[i] = rec
+                updated += 1
+                if sleep_s: time.sleep(sleep_s)
                 continue
-
-            trades = _query_trades_by_ids(kraken, trade_ids)
-            pnl = _pnl_from_trades(trades)
-
-            rec["pnl"] = pnl
-            rec["closedIds"] = trade_ids
-            rows[i] = rec
-            updated += 1
-
-            if sleep_s:
-                time.sleep(sleep_s)
+            # B) niente closetxid → inferisci chiusura da stato (senza PnL, mancano gli open legs)
+            pos_before = float(_pos_before_from_record(rec))
+            is_close = (side == "sell" and pos_before > 0) or (side == "buy" and pos_before < 0)
+            if is_close:
+                rec["is_closure"] = True
+                rec["executedIds"] = own_trades
+                rows[i] = rec
+                updated += 1
+                if sleep_s: time.sleep(sleep_s)
 
         except Exception as e:
             rec.setdefault("reconcile_error", str(e))
