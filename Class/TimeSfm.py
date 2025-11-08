@@ -206,6 +206,39 @@ def _download_close(PAIR: str, SYM: str) -> pd.Series:
         # segnala a chi chiama che questa pair va skippata
         raise RuntimeError(f"SKIP {PAIR}: non disponibile su Yahoo/Kraken")
     return s
+
+
+def _compute_pivots(close: pd.Series, lookback: int = 5) -> Dict[str, float]:
+    """Calcola i pivot point classici utilizzando la serie di prezzi `close`.
+
+    Per ottenere un'approssimazione robusta quando si dispone solo dei prezzi di
+    chiusura, calcola il massimo e il minimo sugli ultimi `lookback` valori e
+    usa l'ultimo prezzo di chiusura disponibile come close di riferimento.
+    Ritorna un dizionario con pp, r1, r2, s1, s2.
+    """
+
+    if close is None or close.empty:
+        raise ValueError("Serie close vuota: impossibile calcolare i pivot")
+
+    tail = close.iloc[-lookback:] if len(close) >= lookback else close
+    high = float(tail.max())
+    low = float(tail.min())
+    last_close = float(tail.iloc[-1])
+
+    pp = (high + low + last_close) / 3.0
+    r1 = (2 * pp) - low
+    s1 = (2 * pp) - high
+    range_hl = high - low
+    r2 = pp + range_hl
+    s2 = pp - range_hl
+
+    return {
+        "pp": float(pp),
+        "r1": float(r1),
+        "r2": float(r2),
+        "s1": float(s1),
+        "s2": float(s2),
+    }
 # =============== util ===============
 def _finite(x) -> bool:
     a = np.asarray(x, dtype=float)
@@ -348,6 +381,8 @@ def main(pairInput, symInput):
     uh      = float(np.mean((p90 - p10) / np.maximum(p50, 1e-12)))
     signal  = float(np.clip(edge_1d / max(u1, 1e-6), -1.0, 1.0))
 
+    pivots = _compute_pivots(close)
+
     meta: Dict[str, Any] = {
         "pair": PAIR,
         "ts_unix": int(time.time()),
@@ -363,6 +398,7 @@ def main(pairInput, symInput):
         "uncert_h": float(uh),
         "signal": signal,
     }
+    meta.update({f"pivot_{k}": v for k, v in pivots.items()})
 
     features = {
         "timesfm_edge_1d": meta["edge_1d"],
