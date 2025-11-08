@@ -280,6 +280,7 @@ class AutoFeaturizer:
         ask = self._num(now.get("ask"))
         last= self._num(now.get("last"))
         mid = self._num(now.get("mid"), (bid+ask)/2 if (bid>0 and ask>0) else last)
+        pivot_ctx = _pivot_context(row, mid)
 
         lot_dec   = int(pl.get("lot_decimals") or 8)
         pair_dec  = int(pl.get("pair_decimals") or 5)
@@ -315,6 +316,30 @@ class AutoFeaturizer:
         self._add(vec, "derived.trend_bias:num", trend_bias)
         self._add(vec, "derived.vol_regime:num", vol_regime)
 
+        if pivot_ctx.get("has"):
+            zone = pivot_ctx.get("zone")
+            if zone is not None:
+                zone_f = float(zone)
+                self._add(vec, "derived.pivot.zone:num", zone_f)
+                self._add(vec, "derived.pivot.zone_abs:num", abs(zone_f))
+            bias = pivot_ctx.get("bias")
+            if bias is not None:
+                self._add(vec, "derived.pivot.bias:num", float(bias))
+            rng = pivot_ctx.get("range_norm")
+            if rng is not None:
+                self._add(vec, "derived.pivot.range_norm:num", float(rng))
+            dist_up = pivot_ctx.get("dist_up")
+            if dist_up is not None:
+                self._add(vec, "derived.pivot.dist_up:num", float(dist_up))
+            dist_down = pivot_ctx.get("dist_down")
+            if dist_down is not None:
+                self._add(vec, "derived.pivot.dist_down:num", float(dist_down))
+            closeness = pivot_ctx.get("closeness")
+            if closeness is not None:
+                closeness_f = float(closeness)
+                self._add(vec, "derived.pivot.closeness:num", closeness_f)
+                self._add(vec, "derived.pivot.closeness_inv:num", math.exp(-abs(closeness_f) * 120.0))
+
         # --- campi per cost estimator in trainer (se disponibili)
         slip_in  = self._num(now.get("slippage_buy_pct"))
         slip_out = self._num(now.get("slippage_sell_pct"))
@@ -340,6 +365,32 @@ class AutoFeaturizer:
             "lev_buy_max":  [lev_buy_max],
             "lev_sell_max": [lev_sell_max],
         }
+
+        levels = pivot_ctx.get("levels", {})
+
+        def _pval(name: str) -> Optional[float]:
+            val = levels.get(name)
+            try:
+                return float(val) if val is not None else None
+            except Exception:
+                return None
+
+        aux.update({
+            "pivot_has_meta": [1.0 if pivot_ctx.get("has") else 0.0],
+            "pivot_pp": [_pval("pp")],
+            "pivot_r1": [_pval("r1")],
+            "pivot_r2": [_pval("r2")],
+            "pivot_s1": [_pval("s1")],
+            "pivot_s2": [_pval("s2")],
+            "pivot_near_up": [pivot_ctx.get("near_up")],
+            "pivot_near_down": [pivot_ctx.get("near_down")],
+            "pivot_near_up_dist": [pivot_ctx.get("dist_up")],
+            "pivot_near_down_dist": [pivot_ctx.get("dist_down")],
+            "pivot_zone": [pivot_ctx.get("zone")],
+            "pivot_bias": [pivot_ctx.get("bias")],
+            "pivot_range": [pivot_ctx.get("range_norm")],
+            "pivot_closeness": [pivot_ctx.get("closeness")],
+        })
 
         unit = max(mid, 1e-9)  # per normalizzare EUR -> "pezzi" circa
 
@@ -704,6 +755,22 @@ class TinyRecursiveModel(nn.Module):
         ord_idx = torch.argmax(ord_logits, dim=-1)
         p_reduce = torch.sigmoid(self.head_reduce(y)).squeeze(-1)
 
+        def _aux_val(key: str, idx: int, default: Any = None):
+            arr = aux.get(key)
+            if arr is None:
+                return default
+            try:
+                if isinstance(arr, list):
+                    if idx < len(arr):
+                        val = arr[idx]
+                    else:
+                        return default
+                else:
+                    val = arr
+            except Exception:
+                return default
+            return default if val is None else val
+
         actions: List[Action] = []
         B = y.shape[0]
         for i in range(B):
@@ -751,6 +818,95 @@ class TinyRecursiveModel(nn.Module):
             sl = px * (1.0 - (sl_eff if is_buy else -sl_eff))
             tp = round(tp, pair_dec)
             sl = round(sl, pair_dec)
+
+            def _to_float(val):
+                try:
+                    return float(val)
+                except Exception:
+                    return None
+
+            pivot_has = bool(_aux_val("pivot_has_meta", i, 0.0))
+            pivot_up = _to_float(_aux_val("pivot_near_up", i)) if pivot_has else None
+            pivot_down = _to_float(_aux_val("pivot_near_down", i)) if pivot_has else None
+            pivot_zone = _to_float(_aux_val("pivot_zone", i)) if pivot_has else None
+            pivot_bias = _to_float(_aux_val("pivot_bias", i)) if pivot_has else None
+            pivot_closeness = _to_float(_aux_val("pivot_closeness", i)) if pivot_has else None
+            pivot_pp = _to_float(_aux_val("pivot_pp", i)) if pivot_has else None
+
+            pivot_notes: List[str] = []
+            pivot_force_limit = False
+
+            if pivot_has and mid > 0.0 and px > 0.0:
+                def _mix_from_dist(delta: float) -> float:
+                    if delta <= 0.0015:
+                        return 0.6
+                    if delta <= 0.004:
+                        return 0.4
+                    if delta <= 0.01:
+                        return 0.22
+                    if delta <= 0.02:
+                        return 0.12
+                    return 0.0
+
+                closeness_factor = 1.0
+                if pivot_closeness is not None:
+                    closeness_factor = max(0.0, min(1.0, math.exp(-abs(pivot_closeness) * 80.0)))
+
+                if is_buy:
+                    if pivot_up is not None and pivot_up > px:
+                        delta = abs((pivot_up - px) / max(px, 1e-9))
+                        mix = _mix_from_dist(delta) * closeness_factor
+                        if mix > 0.0:
+                            tp = round(tp * (1.0 - mix) + pivot_up * mix, pair_dec)
+                            pivot_notes.append(f"tp→{pivot_up:.4f}")
+                    if pivot_down is not None and pivot_down < px:
+                        delta = abs((px - pivot_down) / max(px, 1e-9))
+                        mix = _mix_from_dist(delta) * closeness_factor
+                        if mix > 0.0:
+                            px = round(px * (1.0 - mix) + pivot_down * mix, pair_dec)
+                            pivot_force_limit = True
+                            pivot_notes.append(f"px→sup@{pivot_down:.4f}")
+                        guard_buffer = 0.0015 if delta <= 0.004 else 0.003
+                        guard = pivot_down * (1.0 - guard_buffer)
+                        if guard > 0.0:
+                            sl = round(min(sl, guard), pair_dec)
+                            pivot_notes.append(f"sl≤{guard:.4f}")
+                else:
+                    if pivot_down is not None and pivot_down < px:
+                        delta = abs((px - pivot_down) / max(px, 1e-9))
+                        mix = _mix_from_dist(delta) * closeness_factor
+                        if mix > 0.0:
+                            tp = round(tp * (1.0 - mix) + pivot_down * mix, pair_dec)
+                            pivot_notes.append(f"tp→{pivot_down:.4f}")
+                    if pivot_up is not None and pivot_up > px:
+                        delta = abs((pivot_up - px) / max(px, 1e-9))
+                        mix = _mix_from_dist(delta) * closeness_factor
+                        if mix > 0.0:
+                            px = round(px * (1.0 - mix) + pivot_up * mix, pair_dec)
+                            pivot_force_limit = True
+                            pivot_notes.append(f"px→res@{pivot_up:.4f}")
+                        guard_buffer = 0.0015 if delta <= 0.004 else 0.003
+                        guard = pivot_up * (1.0 + guard_buffer)
+                        if guard > 0.0:
+                            sl = round(max(sl, guard), pair_dec)
+                            pivot_notes.append(f"sl≥{guard:.4f}")
+
+                if is_buy and tp <= px:
+                    tp = round(px * 1.001, pair_dec)
+                elif (not is_buy) and tp >= px:
+                    tp = round(px * 0.999, pair_dec)
+
+                if is_buy and sl >= px:
+                    sl = round(px * 0.995, pair_dec)
+                elif (not is_buy) and sl <= px:
+                    sl = round(px * 1.005, pair_dec)
+
+                if pivot_zone is not None:
+                    pivot_notes.append(f"zone={pivot_zone:+.4f}")
+                if pivot_bias is not None:
+                    pivot_notes.append(f"bias={pivot_bias:+.4f}")
+                if pivot_pp is not None:
+                    pivot_notes.append(f"pp={pivot_pp:.4f}")
 
             frac = max(min(float(qty_frac[i].item()), max_qfrac), 0.02)
 
@@ -872,11 +1028,16 @@ class TinyRecursiveModel(nn.Module):
 
             oi = int(ord_idx[i].item())
             ordertype = "market" if oi == 1 else "limit"
+            if pivot_has and pivot_force_limit and trade_phase != "hold":
+                ordertype = "limit"
             price_out = px
             tif_map = {0: "IOC", 1: "FOK", 2: "GTC"}
             tif_out = "IOC" if ordertype == "market" else tif_map.get(int(tif_idx[i].item()), "GTC")
 
-            note = f"trade_phase={trade_phase}"
+            note_parts = [f"trade_phase={trade_phase}"]
+            if pivot_has and pivot_notes:
+                note_parts.append("pivot=" + ";".join(pivot_notes))
+            note = " | ".join(note_parts)
             actions.append(Action(
                 pair=pair, side=side, qty=qty, price=price_out,
                 ordertype=ordertype, take_profit=tp,
@@ -978,8 +1139,94 @@ def _blend_vec(blend: Dict[str,Number], weights: Dict[str,Number]) -> Tuple[List
         v.append(_f(blend.get(s))); w.append(_f(weights.get(s,1.0)))
     return v, w
 
+
+def _pivot_context(row: Dict[str, Any], mid: float) -> Dict[str, Any]:
+    """Estrarre informazioni di contesto sui pivot point dal row TimesFM."""
+
+    info = (row.get("info") or {})
+    meta_sources: List[Dict[str, Any]] = []
+    fc_meta = info.get("FORECAST_META")
+    if isinstance(fc_meta, dict):
+        meta_sources.append(fc_meta)
+    row_meta = row.get("meta")
+    if isinstance(row_meta, dict):
+        meta_sources.append(row_meta)
+
+    levels: Dict[str, float] = {}
+    for src in meta_sources:
+        for key in ("pp", "r1", "r2", "s1", "s2"):
+            raw = src.get(f"pivot_{key}")
+            if _is_num(raw):
+                levels[key] = float(raw)
+
+    ctx = {
+        "has": bool(levels),
+        "levels": levels,
+        "near_up": None,
+        "near_down": None,
+        "dist_up": None,
+        "dist_down": None,
+        "zone": None,
+        "bias": None,
+        "range_norm": None,
+        "closeness": None,
+    }
+
+    if not levels or not _is_num(mid) or mid <= 0.0:
+        return ctx
+
+    mid_f = float(mid)
+    denom = max(mid_f, 1e-9)
+
+    above = sorted([val for val in levels.values() if val >= mid_f])
+    below = sorted([val for val in levels.values() if val <= mid_f])
+
+    near_up = above[0] if above else None
+    near_down = below[-1] if below else None
+
+    if near_up == near_down:
+        above_strict = sorted([val for val in levels.values() if val > mid_f])
+        below_strict = sorted([val for val in levels.values() if val < mid_f])
+        near_up = above_strict[0] if above_strict else near_up
+        near_down = below_strict[-1] if below_strict else near_down
+
+    dist_up = ((near_up - mid_f) / denom) if (near_up is not None) else None
+    dist_down = ((near_down - mid_f) / denom) if (near_down is not None) else None
+
+    hi = max(levels.values())
+    lo = min(levels.values())
+    rng = (hi - lo) / denom if hi != lo else 0.0
+
+    pp = levels.get("pp")
+    zone = ((mid_f - pp) / denom) if (pp is not None) else None
+
+    bias = None
+    if dist_up is not None or dist_down is not None:
+        up_abs = abs(dist_up) if dist_up is not None else float("inf")
+        down_abs = abs(dist_down) if dist_down is not None else float("inf")
+        if math.isfinite(up_abs) or math.isfinite(down_abs):
+            bias = (down_abs - up_abs)
+
+    closeness = None
+    finite_dists = [abs(d) for d in [dist_up, dist_down] if d is not None]
+    if finite_dists:
+        closeness = min(finite_dists)
+
+    ctx.update({
+        "near_up": near_up,
+        "near_down": near_down,
+        "dist_up": dist_up,
+        "dist_down": dist_down,
+        "zone": zone,
+        "bias": bias,
+        "range_norm": rng,
+        "closeness": closeness,
+    })
+    return ctx
+
 def featurize_one(row: Dict[str,Any], blend: Dict[str,Number], goal_state: Optional[Dict[str,Any]], strategy_weights: Dict[str,Number]) -> Tuple[List[float], Dict[str,List[Any]]]:
     nowf = _now_feats(row); bias = _bias_ma(row); chgs = _changes(row); ors = _or_slip(row); pf = _portfolio(row); pend = _pend_delta(row)
+    pivot_ctx = _pivot_context(row, nowf["mid"])
     urg, nd, nw = _goal(goal_state); bvec, wvec = _blend_vec(blend, strategy_weights)
     flat = [nowf["mid"], nowf["bid"], nowf["ask"], nowf["spread"], nowf["vwap_now"],
             bias["ema50_1h"], bias["ema200_1h"], bias["ema50_4h"], bias["ema200_4h"],
@@ -996,6 +1243,32 @@ def featurize_one(row: Dict[str,Any], blend: Dict[str,Number], goal_state: Optio
            "ordermin":[pl.get("ordermin") or 0.0], "free_quote":[pf["free_quote"]], "free_base":[pf["free_base"]],
            "pos_margin_base":[pos_margin_base], "pos_base":[pf["pos_base"]],
            "max_quote_frac":[strategy_weights.get("max_quote_frac",0.12)], "min_notional_eur":[strategy_weights.get("min_notional_eur",5.0)]}
+
+    levels = pivot_ctx.get("levels", {})
+
+    def _pval(name: str) -> Optional[float]:
+        val = levels.get(name)
+        try:
+            return float(val) if val is not None else None
+        except Exception:
+            return None
+
+    aux.update({
+        "pivot_has_meta": [1.0 if pivot_ctx.get("has") else 0.0],
+        "pivot_pp": [_pval("pp")],
+        "pivot_r1": [_pval("r1")],
+        "pivot_r2": [_pval("r2")],
+        "pivot_s1": [_pval("s1")],
+        "pivot_s2": [_pval("s2")],
+        "pivot_near_up": [pivot_ctx.get("near_up")],
+        "pivot_near_down": [pivot_ctx.get("near_down")],
+        "pivot_near_up_dist": [pivot_ctx.get("dist_up")],
+        "pivot_near_down_dist": [pivot_ctx.get("dist_down")],
+        "pivot_zone": [pivot_ctx.get("zone")],
+        "pivot_bias": [pivot_ctx.get("bias")],
+        "pivot_range": [pivot_ctx.get("range_norm")],
+        "pivot_closeness": [pivot_ctx.get("closeness")],
+    })
     return flat, aux
 
 # --- Router featurizer: hashing schema-free oppure set fisso (fallback) ---
@@ -1006,9 +1279,15 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
                     strategy_weights: Dict[str,Number], run_aux: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, Dict[str,List[Any]]]:
     if USE_HASH_FEATS:
         X = []
-        aux = {k:[] for k in ["pair","mid","bid","ask","lot_decimals","pair_decimals",
-                               "ordermin","free_quote","free_base","pos_margin_base","pos_base",
-                               "slippage_in","slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur","lev_buy_max","lev_sell_max"]}
+        aux = {k:[] for k in [
+            "pair","mid","bid","ask","lot_decimals","pair_decimals",
+            "ordermin","free_quote","free_base","pos_margin_base","pos_base",
+            "slippage_in","slippage_out","fee_maker","fee_taker",
+            "max_quote_frac","min_notional_eur","lev_buy_max","lev_sell_max",
+            "pivot_has_meta","pivot_pp","pivot_r1","pivot_r2","pivot_s1","pivot_s2",
+            "pivot_near_up","pivot_near_down","pivot_near_up_dist","pivot_near_down_dist",
+            "pivot_zone","pivot_bias","pivot_range","pivot_closeness"
+        ]}
         for row, blend in zip(rows, blends):
             v, a = _auto_feat.featurize(row, blend, goal_state, strategy_weights)
             # --- INIETTA segnali di contesto per il GRU (per ogni riga del batch) ---
@@ -1071,7 +1350,14 @@ def featurize_batch(rows: List[Dict[str,Any]], blends: List[Dict[str,Number]],
         return X_t, aux
     else:
         # fallback alle features hardcoded esistenti
-        X = []; aux = {k:[] for k in ["pair","mid","bid","ask","lot_decimals","pair_decimals","ordermin","free_quote","free_base","pos_margin_base","pos_base","slippage_in","slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur"]}
+        X = []; aux = {k:[] for k in [
+            "pair","mid","bid","ask","lot_decimals","pair_decimals","ordermin",
+            "free_quote","free_base","pos_margin_base","pos_base","slippage_in",
+            "slippage_out","fee_maker","fee_taker","max_quote_frac","min_notional_eur",
+            "pivot_has_meta","pivot_pp","pivot_r1","pivot_r2","pivot_s1","pivot_s2",
+            "pivot_near_up","pivot_near_down","pivot_near_up_dist","pivot_near_down_dist",
+            "pivot_zone","pivot_bias","pivot_range","pivot_closeness"
+        ]}
         for row, blend in zip(rows, blends):
             flat, a = featurize_one(row, blend, goal_state, strategy_weights)
             X.append(flat)
@@ -1305,6 +1591,17 @@ class TRMAgent:
                 "uncert_h": meta.get("timesfm_uncert_h"),
                 "p10_T1": p10_T1, "p50_T1": p50_T1, "p90_T1": p90_T1,
             }
+            pivots_meta = {k: pm.get(f"pivot_{k}") for k in ("pp","r1","r2","s1","s2") if pm.get(f"pivot_{k}") is not None}
+            if pivots_meta:
+                inputs["forecast"]["pivots"] = pivots_meta
+            piv_ctx = _pivot_context(row, inputs["now"]["mid"])
+            if piv_ctx.get("has"):
+                if piv_ctx.get("zone") is not None:
+                    inputs["forecast"]["pivot_zone"] = float(piv_ctx.get("zone"))
+                if piv_ctx.get("bias") is not None:
+                    inputs["forecast"]["pivot_bias"] = float(piv_ctx.get("bias"))
+                if piv_ctx.get("range_norm") is not None:
+                    inputs["forecast"]["pivot_range_norm"] = float(piv_ctx.get("range_norm"))
             pair = row.get("pair") or f"{row.get('base','?')}/{row.get('quote','?')}"
             pair2input[pair] = {
                 "inputs": inputs,
