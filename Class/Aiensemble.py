@@ -2602,9 +2602,9 @@ class AIEnsembleTrader:
         self.use_trm = True  # interruttore rapido
         self.trm_cfg = TRMConfig(
             feature_dim=None,     # verrà forzato dal TRMAgent alle FEATURES correnti
-            hidden_dim=64,
-            mlp_hidden=128,
-            K_refine=3,
+            hidden_dim=384,
+            mlp_hidden=768,
+            K_refine=10,
             max_actions_per_pair=2,
             norm_eps=1e-6,
             log_path=os.path.join(self.output_dir or ".", "trm_log", "shadow_actions.jsonl") if self.output_dir else None,

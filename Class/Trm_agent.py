@@ -337,6 +337,20 @@ class AutoFeaturizer:
                 self._add(vec, "tpv.dir_fwd:num", math.copysign(1.0, (float(t_p1) - t0)) if (t_p1 and t_p1 != t0) else 0.0)
             except Exception:
                 pass
+                    # --- NEW: TPV 5D DENSO (append al vettore) ---------------------------
+        if USE_TPV_DENSE:
+            if t0 and t0 > 0.0:
+                tpv5 = [
+                    (float(t_m2) / t0) if (t_m2 and t_m2 > 0.0) else 0.0,  # t-2 / t0
+                    (float(t_m1) / t0) if (t_m1 and t_m1 > 0.0) else 0.0,  # t-1 / t0
+                    1.0,                                                   # t0 / t0
+                    (float(t_p1) / t0) if (t_p1 and t_p1 > 0.0) else 0.0,  # t+1 / t0
+                    (float(t_p2) / t0) if (t_p2 and t_p2 > 0.0) else 0.0,  # t+2 / t0
+                ]
+            else:
+                tpv5 = [0.0, 0.0, 0.0, 0.0, 0.0]
+            # CONCATENA il blocco denso in coda al vettore hashed
+            vec.extend(tpv5)
         # 2) associazione ai pivot principali: distanze relative per t0 e t+1
         levels = pivot_ctx.get("levels", {}) if isinstance(pivot_ctx, dict) else {}
 
@@ -600,6 +614,13 @@ class AutoFeaturizer:
 USE_HASH_FEATS = True
 HASH_DIM = 8192 # puoi portarlo a 1024/2048 se vuoi più capacità
 
+# --- NEW: blocco denso TPV (t-2,t-1,t0,t+1,t+2) normalizzato a t0 ---
+TPV_DENSE_DIM = 5
+USE_TPV_DENSE = True  # se True, il featurizer appende 5 float a fine vettore
+
+# --- NEW: abilita la micro-head dedicata al 5D ---
+USE_TPV5_HEAD = True
+
 @dataclass
 class Action:
     pair: str
@@ -617,6 +638,9 @@ class Action:
     _side_prob: Optional[float] = None
     _entropy: Optional[float] = None
     trade_phase: Optional[str] = None
+    confSide: Optional[float] = None
+
+
 
     def as_dict(self, keep_none: bool = False) -> dict:
         d = asdict(self)            # non rimuove None
@@ -634,9 +658,9 @@ class Action:
 @dataclass
 class TRMConfig:
     feature_dim: int = 128
-    hidden_dim: int = 128
-    mlp_hidden: int = 256
-    K_refine: int = 6
+    hidden_dim: int = 384
+    mlp_hidden: int = 768
+    K_refine: int = 15
     max_actions_per_pair: int = 2
     norm_eps: float = 1e-6
     log_path: Optional[str] = None
@@ -649,7 +673,7 @@ class TRMConfig:
     memory_path: Optional[str] = None
     act_enabled: bool = True           # abilita halting adattivo (se False usa K fisso)
     act_threshold: float = 0.60
-    act_min_steps: int = 1
+    act_min_steps: int = 2
     # passi minimi prima di poter fermare
 # -----------------------------
 # Running normalizer
@@ -740,7 +764,7 @@ class TinyRecursiveModel(nn.Module):
         y0: Optional[torch.Tensor] = None,
         max_steps: Optional[int] = None,
         min_steps: Optional[int] = None,
-        threshold: float = 0.60,
+        threshold: float = 0.70,
         return_stats: bool = True,
     ):
         """
@@ -748,7 +772,7 @@ class TinyRecursiveModel(nn.Module):
         Usa la stessa normalizzazione di improve() ed è retro-compatibile.
         """
         self.eval()
-        T = int(max_steps or self.cfg.K_refine)
+        T = int(max_steps)
         m = int(min_steps or getattr(self.cfg, "act_min_steps", 1) or 1)
         x_n = self.norm(x)
         B = x_n.shape[0]
@@ -856,6 +880,11 @@ class TinyRecursiveModel(nn.Module):
             side_idx = int(torch.argmax(p_side[i]).item())
             p_hat = float(p_side[i, side_idx].item())
             H = float((-(p_side[i] * torch.log(p_side[i] + 1e-12)).sum()).item())
+
+
+            H_norm = H / math.log(3.0)
+            score_abs = score[i].item()    # già in [-1,1]
+            conf = p_hat * (1.0 - max(0.0, min(1.0, H_norm))) * (0.5 + 0.5*score_abs)
 
             is_buy  = (side_idx == 0)
             is_hold = (side_idx == 1)
@@ -1042,7 +1071,7 @@ class TinyRecursiveModel(nn.Module):
                     pair=pair, side="hold", qty=0.0, price=px,
                     ordertype="none", take_profit=tp, stop_loss=None,
                     leverage=None, time_in_force="GTC", score=float(score[i].item()),
-                    _side_prob=p_hat, _entropy=H, notes="trade_phase=hold", trade_phase="hold"
+                    _side_prob=p_hat, _entropy=H, notes="trade_phase=hold", trade_phase="hold", confSide=conf
                 ))
                 continue
 
@@ -1096,7 +1125,7 @@ class TinyRecursiveModel(nn.Module):
                 leverage=lev_out, stop_loss=sl,
                 time_in_force=tif_out, reduce_only=reduce_only,
                 score=float(score[i].item()), notes=note, trade_phase=trade_phase,
-                _side_prob=p_hat, _entropy=H
+                _side_prob=p_hat, _entropy=H, confSide=conf
             ))
 
         return actions
@@ -1450,7 +1479,7 @@ class TRMAgent:
         if cfg is None:
             cfg = TRMConfig()
         if USE_HASH_FEATS:
-            cfg.feature_dim = HASH_DIM
+            cfg.feature_dim = HASH_DIM + (TPV_DENSE_DIM if USE_TPV_DENSE else 0)
         else:
             cfg.feature_dim = len(FEATURE_SPEC.fields)
         self.cfg = cfg
@@ -1597,7 +1626,7 @@ class TRMAgent:
         if getattr(self.cfg, "act_enabled", False):
             yK, act_stats = self.model.improve_adaptive(
                 X, y0=y0,
-                max_steps=int(K or self.cfg.K_refine),
+                max_steps=int(self.cfg.K_refine),
                 min_steps=int(getattr(self.cfg, "act_min_steps", 1)),
                 threshold=float(getattr(self.cfg, "act_threshold", 0.60)),
                 return_stats=True,
@@ -1694,13 +1723,8 @@ class TRMAgent:
             for a in final:
                 decision_id = str(uuid.uuid4())
 
-                # Calcolo confidenza aggregata
-                p_hat = float(getattr(a, "_side_prob", 0.0))        # max softmax
-                H = float(getattr(a, "_entropy", 0.0))              # entropia
-                H_norm = H / math.log(3.0)
-                score_abs = abs(float(getattr(a, "score", 0.0)))    # già in [-1,1]
-                conf = p_hat * (1.0 - max(0.0, min(1.0, H_norm))) * (0.5 + 0.5*score_abs)
-                if conf < 0.60:
+
+                if a.confSide < 0.60:
                     a.side = "hold"
                     self._log_uncertain_decision_id(decision_id, conf)
                 # End Calcolo confidenza aggregata
@@ -1745,7 +1769,7 @@ class TRMAgent:
                 for a in final:
                     if a.price is None:
                         continue
-                    if getattr(a, "trade_phase", None) == "open_long" and a.side == "buy" and not a.reduce_only:
+                    if getattr(a, "trade_phase", None) == "open_long" and a.side == "buy" and (a.reduce_only == False or a.reduce_only is None):
                         spent += float(a.qty) * float(a.price)
                     elif getattr(a, "trade_phase", None) == "open_short" and a.leverage is not None:
                         spent += float(a.qty) * float(a.price)
@@ -1953,5 +1977,8 @@ def _legacy_one(row: dict, a: "Action", blend_val: float, pair_decimals: int) ->
 
 if USE_HASH_FEATS:
     FEATURE_NAMES = [f"hashed_{i}" for i in range(HASH_DIM)]
+    if USE_TPV_DENSE:
+        FEATURE_NAMES += ["tpv5.t-2_div_t0","tpv5.t-1_div_t0","tpv5.t0_div_t0",
+                        "tpv5.t+1_div_t0","tpv5.t+2_div_t0"]
 else:
     FEATURE_NAMES = FEATURE_SPEC.fields
